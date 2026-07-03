@@ -265,6 +265,10 @@ def _skip_and_collect_streams(
     streams: list[StreamInfo] = []
     pos = start_pos
 
+    if pos % 4 != 0:
+        print(f"Warning: Correcting unaligned pos {pos :#x}")
+        pos = (pos + 4 - 1) & ~(4 - 1)
+
     while True:
         f.seek(pos)
         raw_hdr = read_exact(f, STREAM_HDR_SIZE)
@@ -287,7 +291,7 @@ def _skip_and_collect_streams(
         # then realign to 4-byte boundary for the next stream header.
         pos = data_start + sh.length
         if pos % 4 != 0:
-            pos = (pos + 3) & ~3
+            pos = (pos + 4 - 1) & ~(4 - 1)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -356,6 +360,7 @@ def parse_mtf(
     indent_depth = 0
 
     while True:
+        print(f"DBLK {len(results)}, {pos = :#x}")
         f.seek(pos)
         try:
             raw_hdr = read_exact(f, DB_HDR_SIZE)
