@@ -11,11 +11,12 @@ Parsing strategy (linear traversal, no filemarks on disk):
      d. Build DblkInfo, output, advance
 """
 
-from collections.abc import Sequence
+import itertools
 import logging
 import struct
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import Any, BinaryIO, Self
+from typing import Any, BinaryIO, Self, TextIO
 
 from .constants import (
     DB_HDR_SIZE,
@@ -26,6 +27,7 @@ from .constants import (
     MTF_DIRB,
     MTF_FILE,
     MTF_CFIL,
+    MTF_ESPB,
     MTF_ESET,
     MTF_EOTM,
     MTF_SFMB,
@@ -196,7 +198,9 @@ class DblkInfo:
                 fields.append(f"SFMB_size={self.fields['sfmb_size']}")
             # TODO
         else:
-            fields += f"offset={self.file_offset :#x}", f"cb_id={self.control_block_id}"
+            if self.file_offset is not None:
+                fields.append(f"offset={self.file_offset :#x}")
+            fields.append(f"cb_id={self.control_block_id}")
             if self.type_id not in {MTF_ESET, MTF_SFMB, MTF_EOTM}:
                 fields.append(f"FLA={self.fla}")
             if self.type_id == MTF_FILE or self.display_size != 0:
@@ -361,7 +365,7 @@ def _skip_and_collect_streams(
 
 def parse_mtf(
     f: BinaryIO
-) -> list[DblkInfo]:
+) -> Iterator[DblkInfo]:
     """Parse an MTF (BKF) file and return a list of DBLK info records.
 
     The file must be opened in binary mode (``"rb"``).
@@ -370,7 +374,6 @@ def parse_mtf(
         MTFParseError: on structural violations.
         EOFError:      if the file ends unexpectedly mid-structure.
     """
-    results: list[DblkInfo] = []
 
     # ── Phase 1: Read MTF_TAPE at offset 0 ──
     f.seek(0)
@@ -382,7 +385,7 @@ def parse_mtf(
     tape_hdr = DBHeader.from_bytes(tape_raw)
     if tape_hdr.dblk_type != MTF_TAPE:
         raise MTFParseError(f"Expected MTF_TAPE at head, got {tape_hdr.type_name}")
-    _log.debug(f"Tape header: {tape_hdr}")
+    _log.debug(f"Tape header: {tape_hdr !r}")
 
     # Read key fields from MTF_TAPE body (offsets relative to DBLK start).
     flb_size = _read_u16_at(f, 84)          # Format Logical Block Size
@@ -400,12 +403,12 @@ def parse_mtf(
         tape_hdr, tape_streams,
         file_offset=0,
         flb_size=flb_size, **dict(sfmb_size=sfmb_byte_size) if sfmb_block_size else {})
-    results.append(info)
+    yield info
 
     # ── Phase 2: Traverse remaining DBLKs ──
     indent_depth = 0
 
-    while True:
+    for i in itertools.count(1):
         f.seek(pos)
         try:
             raw_hdr = _read_exact(f, DB_HDR_SIZE)
@@ -416,7 +419,7 @@ def parse_mtf(
 
         hdr = DBHeader.from_bytes(raw_hdr)
         dblk_offset = pos
-        _log.debug(f"DBLK {len(results)}, offset {dblk_offset :#x}: {hdr}")
+        _log.debug(f"DBLK {i}, offset {dblk_offset :#x}: {hdr !r}")
 
         if hdr.dblk_type == MTF_CFIL:
             raise MTFParseError(f"Corrupt object DBLK at offset {dblk_offset :#x}")
@@ -438,10 +441,10 @@ def parse_mtf(
 
         # ── Build DblkInfo (after streams are known) ──
         info = DblkInfo.from_header(hdr, streams, file_offset=dblk_offset)
-        results.append(info)
+        yield info
 
         # ── Output ──
-        indent_depth = _update_indent(hdr.dblk_type, indent_depth)
+        # indent_depth = _update_indent(hdr.dblk_type, indent_depth)
 
         # if not quiet:
         #     _print_dblk(info, indent_depth, is_sfmb) # TODO: Print when complete or manually (only on error?)
@@ -450,25 +453,34 @@ def parse_mtf(
             _log.info("EOTM reached")
             break
 
-    _log.info(f"Total DBLKs: {len(results)}")
-    return results
+    _log.info(f"Parsed DBLKs: {i}")
 
 
 # ═══════════════════════════════════════════════════════════════════
 # Output helpers
 # ═══════════════════════════════════════════════════════════════════
 
-def _update_indent(dblk_type: bytes, current: int) -> int:
-    """Return the new indent depth based on DBLK type (Implied Precedence).
+_dblk_level_map = {
+    MTF_TAPE: 0,
+    MTF_SSET: 1,
+    MTF_VOLB: 2,
+    MTF_DIRB: 3,
+    MTF_FILE: 4,
+    MTF_CFIL: -1,
+    MTF_ESPB: 2,
+    MTF_ESET: 1,
+    MTF_EOTM: 0,
+    MTF_SFMB: 0,
+}
 
-    SFMB is a structural marker — it does not alter the hierarchy.
-    """
-    mapping = {
-        MTF_SSET: 0,
-        MTF_VOLB: 1,
-        MTF_DIRB: 2,
-        MTF_FILE: 3,
-        MTF_ESET: 0,
-        MTF_EOTM: 0,
-    }
-    return mapping.get(dblk_type, current)
+def inspect_mtf_streaming(src: Iterable[DblkInfo], stream: TextIO | None =None) -> Iterator[DblkInfo]:
+    prev_level = 0
+    for dblk_info in src:
+        level = _dblk_level_map.get(dblk_info.type_id, None)
+        level = prev_level if level == -1 else level
+
+        line = ("  " * level if level is not None else "? ") + repr(dblk_info)
+        print(line, file=stream)
+
+        yield dblk_info
+        prev_level = level
