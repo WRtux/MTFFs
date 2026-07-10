@@ -11,9 +11,11 @@ Parsing strategy (linear traversal, no filemarks on disk):
      d. Build DblkInfo, output, advance
 """
 
+from collections.abc import Sequence
+import logging
 import struct
 from dataclasses import dataclass, field
-from typing import BinaryIO
+from typing import Any, BinaryIO, Self
 
 from .constants import (
     DB_HDR_SIZE,
@@ -33,6 +35,8 @@ from .constants import (
     VALID_FLB_SIZES,
 )
 
+
+_log = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════════
 # Data Structures
@@ -60,7 +64,7 @@ class DBHeader:
     string_type: int            # offset 48: uint8  — 0=none, 1=ANSI, 2=Unicode
 
     @classmethod
-    def from_bytes(cls, data: bytes):
+    def from_bytes(cls, data: bytes) -> Self:
         """Unpack a 52-byte Common Block Header."""
         if len(data) < DB_HDR_SIZE:
             raise ValueError(f"Need {DB_HDR_SIZE} bytes for DB_HDR, got {len(data)}")
@@ -116,7 +120,7 @@ class StreamHeader:
     compression_algo: int
 
     @classmethod
-    def from_bytes(cls, data: bytes):
+    def from_bytes(cls, data: bytes) -> Self:
         if len(data) < STREAM_HDR_SIZE:
             raise ValueError(
                 f"Need {STREAM_HDR_SIZE} bytes for Stream Header, got {len(data)}"
@@ -143,18 +147,78 @@ class StreamHeader:
 class DblkInfo:
     """Summary information about one parsed DBLK, including its streams."""
 
-    type_name: str
+    file_offset: int | None = None
     type_id: bytes
     fla: int
-    offset_in_file: int
     display_size: int = 0
     control_block_id: int = 0
-    is_continuation: bool = False
-    streams: list['StreamInfo'] = field(default_factory=list)
+
+    fields: dict[str, Any] = field(default_factory=dict)
+
+    streams: list['StreamInfo'] | None = field(default_factory=list)
 
     @property
-    def stream_count(self) -> int:
-        return len(self.streams)
+    def type_name(self) -> str:
+        """Human-readable DBLK type name."""
+        return DBLK_TYPE_NAMES.get(self.type_id, f"UNKNOWN({self.type_id!r})")
+
+    @property
+    def stream_count(self) -> int | None:
+        return len(self.streams) if self.streams is not None else None
+
+    @classmethod
+    def from_header(cls,
+        header: DBHeader, streams: Sequence['StreamHeader | StreamInfo'] | None =None,
+        file_offset: int | None =None, **kwargs
+    ) -> Self:
+        stream_infos = [
+                StreamInfo.from_header(item) if isinstance(item, StreamHeader) else item
+                for item in streams
+            ] if streams is not None else None
+
+        return cls(
+            file_offset=file_offset,
+            type_id=header.dblk_type,
+            fla=header.format_logical_address,
+            display_size=header.display_size,
+            control_block_id=header.control_block_id,
+            fields={ 'is_continuation': header.is_continuation, **kwargs },
+            streams=stream_infos
+        )
+
+    def __repr__(self) -> str:
+        fields, flags = [], []
+        streams = None
+
+        if self.type_id == MTF_TAPE:
+            fields.append(f"FLB_size={self.fields['flb_size']}")
+            if 'sfmb_size' in self.fields:
+                fields.append(f"SFMB_size={self.fields['sfmb_size']}")
+            # TODO
+        else:
+            fields += f"offset={self.file_offset :#x}", f"cb_id={self.control_block_id}"
+            if self.type_id not in {MTF_ESET, MTF_SFMB, MTF_EOTM}:
+                fields.append(f"FLA={self.fla}")
+            if self.type_id == MTF_FILE or self.display_size != 0:
+                fields.append(f"size={self.display_size :,}")
+            if self.fields.get('is_continuation', False):
+                flags.append("cont")
+            # TODO
+
+        if self.streams is not None:
+            streams = [str(stream) for stream in self.streams]
+
+        field_str = ' '.join(fields) if fields else None
+        flag_str = ','.join(flags) if flags else None
+        stream_str = ', '.join(streams) if streams else "()" if streams is not None else None
+
+        return (f"<{self.type_name}"
+            + (f" {field_str}" if field_str is not None else '')
+            + (f" [{flag_str}]" if flag_str is not None else '')
+            + (f" | {stream_str}" if stream_str is not None else '')
+            + ">")
+
+    # TODO: __str__
 
 @dataclass(kw_only=True)
 class StreamInfo:
@@ -163,21 +227,24 @@ class StreamInfo:
     Captured during the single-pass stream skip — no extra read needed.
     """
 
+    file_offset: int | None = None # absolute file offset of the Stream Header
     stream_id: bytes       # 4-byte ASCII ('STAN', 'SPAD', 'NTEA', ...)
     length: int            # declared byte length of stream data
-    file_offset: int | None = None # absolute file offset of the Stream Header
     fs_attributes: int = 0      # file-system-level flags (BIT0=modified, BIT1=security, …)
     media_attributes: int = 0   # continuation, checksummed, encrypted, compressed
 
     @classmethod
-    def from_header(cls, header: StreamHeader, **kwargs):
+    def from_header(cls,
+        header: StreamHeader,
+        file_offset: int | None =None, **kwargs
+    ) -> Self:
         """Convert to a StreamInfo pinned to a file offset."""
         return cls(
+            file_offset=file_offset,
             stream_id=header.stream_id,
             length=header.length,
             fs_attributes=header.fs_attributes,
             media_attributes=header.media_attributes,
-            **kwargs
         )
 
     @property
@@ -191,6 +258,9 @@ class StreamInfo:
             return self.stream_id.decode("ascii")
         except UnicodeDecodeError:
             return repr(self.stream_id)
+
+    def __str__(self) -> str:
+        return f"{self.stream_id_str}({self.length :,})"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -206,19 +276,20 @@ class MTFParseError(Exception):
 # Low-level I/O helpers
 # ═══════════════════════════════════════════════════════════════════
 
-def read_exact(f: BinaryIO, size: int) -> bytes:
+def _read_exact(f: BinaryIO, size: int) -> bytes:
     """Read exactly `size` bytes from `f` or raise EOFError."""
     data = f.read(size)
     if len(data) < size:
         offset = f.tell() - len(data)
+        end = f.seek(0, 2)
         raise EOFError(
-            f"Expected {size} bytes at offset ~{offset:#x}, "
-            f"got {len(data)} (end of file)"
+            f"Expected {size} bytes at offset {offset :#x} (approx), "
+            f"reached end at {end :#x}"
         )
     return data
 
 
-def read_u16_at(f: BinaryIO, pos: int) -> int:
+def _read_u16_at(f: BinaryIO, pos: int) -> int:
     """Read a little-endian uint16 at absolute file offset `pos`.
 
     Saves and restores the current stream position.
@@ -226,7 +297,7 @@ def read_u16_at(f: BinaryIO, pos: int) -> int:
     saved = f.tell()
     try:
         f.seek(pos)
-        raw = read_exact(f, 2)
+        raw = _read_exact(f, 2)
         return struct.unpack("<H", raw)[0]
     finally:
         f.seek(saved)
@@ -256,13 +327,15 @@ def _skip_and_collect_streams(
     pos = start_pos
 
     if pos % 4 != 0:
-        print(f"Warning: Correcting unaligned pos {pos :#x}")
+        _log.warning(f"Correcting unaligned offset {pos :#x}")
         pos = (pos + 4 - 1) & ~(4 - 1)
 
     while True:
         f.seek(pos)
-        raw_hdr = read_exact(f, STREAM_HDR_SIZE)
+        raw_hdr = _read_exact(f, STREAM_HDR_SIZE)
         sh = StreamHeader.from_bytes(raw_hdr)
+        _log.debug(f"Stream, offset {pos :#x}: {sh}")
+
         streams.append(StreamInfo.from_header(sh, file_offset=pos))
 
         # Stream data starts immediately after the 22-byte header.
@@ -273,9 +346,7 @@ def _skip_and_collect_streams(
             return data_start + sh.length, streams
 
         if sh.stream_id == STREAM_CORRUPT:
-            raise MTFParseError(
-                f"Corrupt stream marker (CRPT) at absolute offset {pos:#x}"
-            )
+            raise MTFParseError(f"Corrupt stream marker at offset {pos :#x}")
 
         # Non-SPAD stream: skip header + declared data length,
         # then realign to 4-byte boundary for the next stream header.
@@ -289,9 +360,7 @@ def _skip_and_collect_streams(
 # ═══════════════════════════════════════════════════════════════════
 
 def parse_mtf(
-    f: BinaryIO,
-    *,
-    quiet: bool = False,
+    f: BinaryIO
 ) -> list[DblkInfo]:
     """Parse an MTF (BKF) file and return a list of DBLK info records.
 
@@ -306,64 +375,51 @@ def parse_mtf(
     # ── Phase 1: Read MTF_TAPE at offset 0 ──
     f.seek(0)
     try:
-        tape_raw = read_exact(f, DB_HDR_SIZE)
+        tape_raw = _read_exact(f, DB_HDR_SIZE)
     except EOFError:
-        raise MTFParseError("File is too small to contain an MTF header")
+        raise MTFParseError("Data is too small to contain MTF header")
 
     tape_hdr = DBHeader.from_bytes(tape_raw)
     if tape_hdr.dblk_type != MTF_TAPE:
-        raise MTFParseError(
-            f"Expected MTF_TAPE at offset 0, "
-            f"got {tape_hdr.type_name} ({tape_hdr.dblk_type!r})"
-        )
+        raise MTFParseError(f"Expected MTF_TAPE at head, got {tape_hdr.type_name}")
+    _log.debug(f"Tape header: {tape_hdr}")
 
     # Read key fields from MTF_TAPE body (offsets relative to DBLK start).
-    flb_size = read_u16_at(f, 84)          # Format Logical Block Size
+    flb_size = _read_u16_at(f, 84)          # Format Logical Block Size
     if flb_size not in VALID_FLB_SIZES:
-        raise MTFParseError(
-            f"Unsupported FLB size {flb_size} at offset 84 "
-            f"(expected 512 or 1024)"
-        )
+        _log.error(f"Unsupported FLB size {flb_size} (expected 512 or 1024)")
 
-    sfmb_block_size = read_u16_at(f, 64)   # Soft Filemark Block Size (× 512)
+    sfmb_block_size = _read_u16_at(f, 64)   # Soft Filemark Block Size (× 512)
     sfmb_byte_size = sfmb_block_size * 512
-
-    if not quiet:
-        print(f"[MTF_TAPE]  FLB size = {flb_size} bytes")
-        if sfmb_block_size:
-            print(f"[MTF_TAPE]  Soft Filemark Block Size = {sfmb_block_size} "
-                  f"× 512 = {sfmb_byte_size} bytes")
 
     # ── Skip TAPE's streams and record them ──
     pos, tape_streams = _skip_and_collect_streams(
         f, tape_hdr.next_offset
     )
-    results.append(DblkInfo(
-        type_name=tape_hdr.type_name,
-        type_id=tape_hdr.dblk_type,
-        fla=tape_hdr.format_logical_address,
-        offset_in_file=0,
-        streams=tape_streams,
-    ))
+    info = DblkInfo.from_header(
+        tape_hdr, tape_streams,
+        file_offset=0,
+        flb_size=flb_size, **dict(sfmb_size=sfmb_byte_size) if sfmb_block_size else {})
+    results.append(info)
 
     # ── Phase 2: Traverse remaining DBLKs ──
     indent_depth = 0
 
     while True:
-        print(f"DBLK {len(results)}, {pos = :#x}")
         f.seek(pos)
         try:
-            raw_hdr = read_exact(f, DB_HDR_SIZE)
-        except EOFError:
-            break  # natural end of file
+            raw_hdr = _read_exact(f, DB_HDR_SIZE)
+        except EOFError as error:
+            _log.warning(f"Reached end when trying to parse DBLK:")
+            _log.warning(error)
+            break
 
         hdr = DBHeader.from_bytes(raw_hdr)
         dblk_offset = pos
+        _log.debug(f"DBLK {len(results)}, offset {dblk_offset :#x}: {hdr}")
 
         if hdr.dblk_type == MTF_CFIL:
-            raise MTFParseError(
-                f"Corrupt object DBLK (MTF_CFIL) at offset {dblk_offset:#x}"
-            )
+            raise MTFParseError(f"Corrupt object DBLK at offset {dblk_offset :#x}")
 
         # ── Skip streams (single pass: collect + advance) ──
         is_sfmb = (hdr.dblk_type == MTF_SFMB)
@@ -371,41 +427,30 @@ def parse_mtf(
         if is_sfmb:
             # SFMB has no data streams (Section 5.2.10).
             streams: list[StreamInfo] = []
-            if sfmb_byte_size == 0:
-                pos = dblk_offset + hdr.next_offset
-            else:
-                pos = dblk_offset + sfmb_byte_size
+            pos = dblk_offset + (sfmb_byte_size if sfmb_byte_size else hdr.next_offset)
         else:
-            pos, streams = _skip_and_collect_streams(
-                f, dblk_offset + hdr.next_offset
-            )
+            try:
+                pos, streams = _skip_and_collect_streams(f, dblk_offset + hdr.next_offset)
+            except EOFError as error:
+                _log.warning(f"Reached end when skipping streams:")
+                _log.warning(error)
+                break
 
         # ── Build DblkInfo (after streams are known) ──
-        info = DblkInfo(
-            type_name=hdr.type_name,
-            type_id=hdr.dblk_type,
-            fla=hdr.format_logical_address,
-            offset_in_file=dblk_offset,
-            display_size=hdr.display_size,
-            control_block_id=hdr.control_block_id,
-            is_continuation=hdr.is_continuation,
-            streams=streams,
-        )
+        info = DblkInfo.from_header(hdr, streams, file_offset=dblk_offset)
         results.append(info)
 
         # ── Output ──
         indent_depth = _update_indent(hdr.dblk_type, indent_depth)
 
-        if not quiet:
-            _print_dblk(info, indent_depth, is_sfmb)
+        # if not quiet:
+        #     _print_dblk(info, indent_depth, is_sfmb) # TODO: Print when complete or manually (only on error?)
 
-        if hdr.dblk_type == MTF_ESET:
-            if not quiet:
-                print(f"\n  End of Data Set at offset {dblk_offset:#08x}")
+        if hdr.dblk_type == MTF_EOTM:
+            _log.info("EOTM reached")
+            break
 
-    if not quiet:
-        print(f"\nTotal DBLKs: {len(results)}")
-
+    _log.info(f"Total DBLKs: {len(results)}")
     return results
 
 
@@ -427,35 +472,3 @@ def _update_indent(dblk_type: bytes, current: int) -> int:
         MTF_EOTM: 0,
     }
     return mapping.get(dblk_type, current)
-
-
-def _print_dblk(info: DblkInfo, indent_depth: int, is_sfmb: bool) -> None:
-    """Print one DBLK line with hierarchy indent and stream summary."""
-    prefix = "  " * indent_depth
-    tid = info.type_id
-
-    size_str = ""
-    if info.display_size and tid == MTF_FILE:
-        size_str = f"  size={info.display_size:,}"
-
-    cont_str = " [cont]" if info.is_continuation else ""
-    sfmb_str = " [filemark]" if is_sfmb else ""
-
-    # Stream summary: e.g. "streams: STAN(4096) + CSUM(8) + SPAD(396)"
-    if info.streams:
-        stream_parts = []
-        for s in info.streams:
-            stream_parts.append(f"{s.stream_id_str}({s.length})")
-        stream_str = "  streams: " + " + ".join(stream_parts)
-    else:
-        stream_str = ""
-
-    print(
-        f"{prefix}[{info.type_name:>8}] "
-        f"offset={info.offset_in_file:#08x}  "
-        f"FLA={info.fla}"
-        f"{size_str}"
-        f"{cont_str}"
-        f"{sfmb_str}"
-        f"{stream_str}"
-    )

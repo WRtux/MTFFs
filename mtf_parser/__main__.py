@@ -28,7 +28,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         with open(args.file, "rb") as f:
-            parse_mtf(f, quiet=args.quiet)
+            for info in parse_mtf(f): # parse_mtf(f, quiet=args.quiet)
+                print(info)
     except FileNotFoundError:
         print(f"Error: file not found — {args.file}", file=sys.stderr)
         return 1
