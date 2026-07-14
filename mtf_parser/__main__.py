@@ -6,7 +6,7 @@ Usage:  python -m mtf_parser <file.bkf> [--quiet]
 import sys
 import argparse
 
-from .parser import inspect_mtf_streaming, parse_mtf, MTFParseError
+from .parser import inspect_mtf, parse_mtf, MTFParseError
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -28,8 +28,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         with open(args.file, "rb") as f:
-            for info in inspect_mtf_streaming(parse_mtf(f)):
-                pass
+            inspect_mtf(parse_mtf(f))
     except FileNotFoundError:
         print(f"Error: file not found — {args.file}", file=sys.stderr)
         return 1

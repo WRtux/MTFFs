@@ -16,7 +16,7 @@ import logging
 import struct
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import Any, BinaryIO, Self, TextIO
+from typing import Any, BinaryIO, ClassVar, Self, TextIO
 
 from .constants import (
     DB_HDR_SIZE,
@@ -52,18 +52,39 @@ class DBHeader:
     little-endian per MTF spec Section 4.
     """
 
-    dblk_type: bytes            # offset 0:  4-byte ASCII ('TAPE', 'FILE', ...)
+    type_id: bytes              # offset 0:  4-byte ASCII ('TAPE', 'FILE', ...)
     block_attributes: int       # offset 4:  uint32
     next_offset: int            # offset 8:  uint16 — byte offset from DBLK start to first stream
-    os_id: int                  # offset 10: uint8  — OS identifier (see Appendix A)
-    os_version: int             # offset 11: uint8  — OS-specific structure version
+    _os_id: int                  # offset 10: uint8  — OS identifier (see Appendix A)
+    _os_version: int             # offset 11: uint8  — OS-specific structure version
     display_size: int           # offset 12: uint64 — user-visible size (e.g. file size)
     format_logical_address: int # offset 20: uint64 — FLA within Data Set
-    reserved_mbc: int           # offset 28: uint16 — MBC application-specific storage
+    _reserved_mbc: int           # offset 28: uint16 — MBC application-specific storage
     control_block_id: int       # offset 36: uint32 — sequential ID for error recovery
-    os_specific_size: int       # offset 44: uint16 — size of OS-specific data area
-    os_specific_offset: int     # offset 46: uint16 — offset to OS-specific data
-    string_type: int            # offset 48: uint8  — 0=none, 1=ANSI, 2=Unicode
+    _os_specific_size: int       # offset 44: uint16 — size of OS-specific data area
+    _os_specific_offset: int     # offset 46: uint16 — offset to OS-specific data
+    _string_type: int            # offset 48: uint8  — 0=none, 1=ANSI, 2=Unicode
+    _checksum: int
+
+    _field_specs: ClassVar = [
+        ('type_id', '4s'),
+        ('block_attributes', 'I'),
+        ('next_offset', 'H'),
+        ('_os_id', 'B'),
+        ('_os_version', 'B'),
+        ('display_size', 'Q'),
+        ('format_logical_address', 'Q'),
+        ('_reserved_mbc', 'H'),
+        ('', '6s'),
+        ('control_block_id', 'I'),
+        ('', '4s'),
+        ('_os_specific_size', 'H'),
+        ('_os_specific_offset', 'H'),
+        ('_string_type', 'B'),
+        ('', '1s'),
+        ('_checksum', 'H'),
+    ]
+    _field_struct: ClassVar = struct.Struct('<' + ' '.join(spec[1] for spec in _field_specs))
 
     @classmethod
     def from_bytes(cls, data: bytes) -> Self:
@@ -71,41 +92,20 @@ class DBHeader:
         if len(data) < DB_HDR_SIZE:
             raise ValueError(f"Need {DB_HDR_SIZE} bytes for DB_HDR, got {len(data)}")
 
-        field_specs = [
-            ('dblk_type', '<4s'),
-            ('block_attributes', 'I'),
-            ('next_offset', 'H'),
-            ('os_id', 'B'),
-            ('os_version', 'B'),
-            ('display_size', 'Q'),
-            ('format_logical_address', 'Q'),
-            ('reserved_mbc', 'H'),
-            ('_reserved6', '6s'),
-            ('control_block_id', 'I'),
-            ('_reserved4', '4s'),
-            ('os_specific_size', 'H'),
-            ('os_specific_offset', 'H'),
-            ('string_type', 'B'),
-            ('_reserved1', 'B'),
-            ('_checksum', 'H'),
-        ]
-        fields = struct.unpack(' '.join(spec[1] for spec in field_specs), data)
-        field_dict = {k: fields[i]
-            for i, k in enumerate(spec[0] for spec in field_specs)
-            if not k.startswith('_')}
+        fields = cls._field_struct.unpack(data)
+        field_dict = {k: fields[i] for i, (k, _) in enumerate(cls._field_specs) if k}
 
         return cls(**field_dict)
 
     @property
     def type_name(self) -> str:
         """Human-readable DBLK type name."""
-        return DBLK_TYPE_NAMES.get(self.dblk_type, f"UNKNOWN({self.dblk_type!r})")
+        return DBLK_TYPE_NAMES.get(self.type_id, f"UNKNOWN({self.type_id!r})")
 
     @property
     def is_continuation(self) -> bool:
         """BIT0: this DBLK is a continuation from a previous medium."""
         return bool(self.block_attributes & 0x00000001)
-
 
 @dataclass(kw_only=True)
 class StreamHeader:
@@ -118,8 +118,20 @@ class StreamHeader:
     fs_attributes: int
     media_attributes: int
     length: int
-    encryption_algo: int
-    compression_algo: int
+    _encryption_algo: int
+    _compression_algo: int
+    _checksum: int
+
+    _field_specs: ClassVar = [
+        ('stream_id', '4s'),
+        ('fs_attributes', 'H'),
+        ('media_attributes', 'H'),
+        ('length', 'Q'),
+        ('_encryption_algo', 'H'),
+        ('_compression_algo', 'H'),
+        ('_checksum', 'H'),
+    ]
+    _field_struct: ClassVar = struct.Struct('<' + ' '.join(spec[1] for spec in _field_specs))
 
     @classmethod
     def from_bytes(cls, data: bytes) -> Self:
@@ -128,19 +140,8 @@ class StreamHeader:
                 f"Need {STREAM_HDR_SIZE} bytes for Stream Header, got {len(data)}"
             )
 
-        field_specs = [
-            ('stream_id', '<4s'),
-            ('fs_attributes', 'H'),
-            ('media_attributes', 'H'),
-            ('length', 'Q'),
-            ('encryption_algo', 'H'),
-            ('compression_algo', 'H'),
-            ('_checksum', 'H'),
-        ]
-        fields = struct.unpack(' '.join(spec[1] for spec in field_specs), data)
-        field_dict = {k: fields[i]
-            for i, k in enumerate(spec[0] for spec in field_specs)
-            if not k.startswith('_')}
+        fields = cls._field_struct.unpack(data)
+        field_dict = {k: fields[i] for i, (k, _) in enumerate(cls._field_specs) if k}
 
         return cls(**field_dict)
 
@@ -180,7 +181,7 @@ class DblkInfo:
 
         return cls(
             file_offset=file_offset,
-            type_id=header.dblk_type,
+            type_id=header.type_id,
             fla=header.format_logical_address,
             display_size=header.display_size,
             control_block_id=header.control_block_id,
@@ -222,7 +223,13 @@ class DblkInfo:
             + (f" | {stream_str}" if stream_str is not None else '')
             + ">")
 
-    # TODO: __str__
+    def __str__(self) -> str:
+        if self.type_id in {MTF_VOLB, MTF_DIRB, MTF_FILE}:
+            name = "?" # TODO
+            info_str = f"({name !r} {self.display_size :,})"
+        else:
+            info_str = f"({self.display_size :,})" if self.display_size else ""
+        return f"{self.type_name}{info_str}"
 
 @dataclass(kw_only=True)
 class StreamInfo:
@@ -383,7 +390,7 @@ def parse_mtf(
         raise MTFParseError("Data is too small to contain MTF header")
 
     tape_hdr = DBHeader.from_bytes(tape_raw)
-    if tape_hdr.dblk_type != MTF_TAPE:
+    if tape_hdr.type_id != MTF_TAPE:
         raise MTFParseError(f"Expected MTF_TAPE at head, got {tape_hdr.type_name}")
     _log.debug(f"Tape header: {tape_hdr !r}")
 
@@ -421,11 +428,11 @@ def parse_mtf(
         dblk_offset = pos
         _log.debug(f"DBLK {i}, offset {dblk_offset :#x}: {hdr !r}")
 
-        if hdr.dblk_type == MTF_CFIL:
+        if hdr.type_id == MTF_CFIL:
             raise MTFParseError(f"Corrupt object DBLK at offset {dblk_offset :#x}")
 
         # ── Skip streams (single pass: collect + advance) ──
-        is_sfmb = (hdr.dblk_type == MTF_SFMB)
+        is_sfmb = (hdr.type_id == MTF_SFMB)
 
         if is_sfmb:
             # SFMB has no data streams (Section 5.2.10).
@@ -443,13 +450,7 @@ def parse_mtf(
         info = DblkInfo.from_header(hdr, streams, file_offset=dblk_offset)
         yield info
 
-        # ── Output ──
-        # indent_depth = _update_indent(hdr.dblk_type, indent_depth)
-
-        # if not quiet:
-        #     _print_dblk(info, indent_depth, is_sfmb) # TODO: Print when complete or manually (only on error?)
-
-        if hdr.dblk_type == MTF_EOTM:
+        if hdr.type_id == MTF_EOTM:
             _log.info("EOTM reached")
             break
 
@@ -484,3 +485,7 @@ def inspect_mtf_streaming(src: Iterable[DblkInfo], stream: TextIO | None =None) 
 
         yield dblk_info
         prev_level = level
+
+def inspect_mtf(dblks: Iterable[DblkInfo], stream: TextIO | None =None) -> None:
+    for _ in inspect_mtf_streaming(dblks, stream):
+        pass

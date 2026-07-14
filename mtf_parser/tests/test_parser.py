@@ -311,7 +311,7 @@ class TestDBHeader:
         )
         hdr = DBHeader.from_bytes(raw)
 
-        assert hdr.dblk_type == MTF_TAPE
+        assert hdr.type_id == MTF_TAPE
         assert hdr.type_name == "MTF_TAPE"
         assert hdr.block_attributes == 0x00010000
         assert hdr.next_offset == 200
@@ -331,7 +331,7 @@ class TestDBHeader:
         )
         hdr = DBHeader.from_bytes(raw)
 
-        assert hdr.dblk_type == MTF_FILE
+        assert hdr.type_id == MTF_FILE
         assert hdr.display_size == 12345678
         assert hdr.format_logical_address == 42
         assert hdr.control_block_id == 7
