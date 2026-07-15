@@ -87,14 +87,14 @@ def make_db_header(
 
 
 def make_stream_header(
-    stream_id: bytes = STREAM_PAD,
+    stream_type: bytes = STREAM_PAD,
     length: int = 0,
     fs_attrs: int = 0,
     media_attrs: int = 0,
 ) -> bytes:
     """Build a valid 22-byte Stream Header."""
     return (
-        stream_id
+        stream_type
         + struct.pack("<H", fs_attrs)
         + struct.pack("<H", media_attrs)
         + struct.pack("<Q", length)
@@ -315,11 +315,11 @@ class TestDBHeader:
         assert hdr.type_name == "MTF_TAPE"
         assert hdr.block_attributes == 0x00010000
         assert hdr.next_offset == 200
-        assert hdr.os_id == 14
-        assert hdr.os_version == 0
+        assert hdr._os_id == 14
+        assert hdr._os_version == 0
         assert hdr.display_size == 0
         assert hdr.format_logical_address == 0
-        assert hdr.string_type == 0
+        assert hdr._string_type == 0
 
     def test_parse_file_header(self):
         raw = make_db_header(
@@ -367,14 +367,14 @@ class TestStreamHeader:
         raw = make_stream_header(b"STAN", length=4096)
         sh = StreamHeader.from_bytes(raw)
 
-        assert sh.stream_id == b"STAN"
+        assert sh.type_id == b"STAN"
         assert sh.length == 4096
 
     def test_parse_spad(self):
         raw = make_stream_header(b"SPAD", length=300)
         sh = StreamHeader.from_bytes(raw)
 
-        assert sh.stream_id == b"SPAD"
+        assert sh.type_id == b"SPAD"
         assert sh.length == 300
 
     def test_rejects_short_data(self):
@@ -399,7 +399,7 @@ class TestSkipStreams:
         # 22 (header) + 100 (data) = 122
         assert next_pos == 22 + spad_len
         assert len(streams) == 1
-        assert streams[0].stream_id == STREAM_PAD
+        assert streams[0].type_id == STREAM_PAD
         assert streams[0].length == 100
         assert streams[0].file_offset == 0
 
@@ -423,11 +423,11 @@ class TestSkipStreams:
         assert next_pos == 228
 
         assert len(streams) == 3
-        assert streams[0].stream_id == b"STAN"
+        assert streams[0].type_id == b"STAN"
         assert streams[0].length == 100
-        assert streams[1].stream_id == b"CSUM"
+        assert streams[1].type_id == b"CSUM"
         assert streams[1].length == 8
-        assert streams[2].stream_id == STREAM_PAD
+        assert streams[2].type_id == STREAM_PAD
         assert streams[2].length == 50
 
     def test_corrupt_stream_raises(self):

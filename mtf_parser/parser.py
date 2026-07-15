@@ -16,7 +16,8 @@ import logging
 import struct
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import Any, BinaryIO, ClassVar, Self, TextIO
+from datetime import datetime
+from typing import Any, BinaryIO, ClassVar, Self, TextIO, overload
 
 from .constants import (
     DB_HDR_SIZE,
@@ -38,7 +39,16 @@ from .constants import (
 )
 
 
+type RangeSlice = slice[int | None, int | None, None]
+
 _log = logging.getLogger(__name__)
+
+def _slice_offset[T: slice[int | None]](src: T, offset: int | None) -> T:
+    if offset is None:
+        return src
+    start = src.start + offset if src.start is not None and src.start >= 0 else src.start
+    stop = src.stop + offset if src.stop is not None and src.stop >= 0 else src.stop
+    return slice(start, stop, src.step) # type: ignore
 
 # ═══════════════════════════════════════════════════════════════════
 # Data Structures
@@ -64,7 +74,7 @@ class DBHeader:
     _os_specific_size: int       # offset 44: uint16 — size of OS-specific data area
     _os_specific_offset: int     # offset 46: uint16 — offset to OS-specific data
     _string_type: int            # offset 48: uint8  — 0=none, 1=ANSI, 2=Unicode
-    _checksum: int
+    _checksum: bytes
 
     _field_specs: ClassVar = [
         ('type_id', '4s'),
@@ -82,30 +92,30 @@ class DBHeader:
         ('_os_specific_offset', 'H'),
         ('_string_type', 'B'),
         ('', '1s'),
-        ('_checksum', 'H'),
+        ('_checksum', '2s'),
     ]
     _field_struct: ClassVar = struct.Struct('<' + ' '.join(spec[1] for spec in _field_specs))
-
-    @classmethod
-    def from_bytes(cls, data: bytes) -> Self:
-        """Unpack a 52-byte Common Block Header."""
-        if len(data) < DB_HDR_SIZE:
-            raise ValueError(f"Need {DB_HDR_SIZE} bytes for DB_HDR, got {len(data)}")
-
-        fields = cls._field_struct.unpack(data)
-        field_dict = {k: fields[i] for i, (k, _) in enumerate(cls._field_specs) if k}
-
-        return cls(**field_dict)
+    assert _field_struct.size == DB_HDR_SIZE
 
     @property
     def type_name(self) -> str:
-        """Human-readable DBLK type name."""
-        return DBLK_TYPE_NAMES.get(self.type_id, f"UNKNOWN({self.type_id!r})")
+        return DBLK_TYPE_NAMES.get(self.type_id, 'UNKNOWN')
 
     @property
     def is_continuation(self) -> bool:
         """BIT0: this DBLK is a continuation from a previous medium."""
         return bool(self.block_attributes & 0x00000001)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> Self:
+        """Unpack a 52-byte Common Block Header."""
+        if (size := len(data)) != (struct_size := cls._field_struct.size):
+            raise ValueError(f"Expected {struct_size} bytes for DB_HDR, got {size}")
+
+        fields = cls._field_struct.unpack(data)
+        field_dict = {k: fields[i] for i, (k, _) in enumerate(cls._field_specs) if k}
+
+        return cls(**field_dict)
 
 @dataclass(kw_only=True)
 class StreamHeader:
@@ -114,36 +124,193 @@ class StreamHeader:
     Internal use — callers interact with StreamInfo.
     """
 
-    stream_id: bytes
+    type_id: bytes
     fs_attributes: int
     media_attributes: int
     length: int
     _encryption_algo: int
     _compression_algo: int
-    _checksum: int
+    _checksum: bytes
 
     _field_specs: ClassVar = [
-        ('stream_id', '4s'),
+        ('type_id', '4s'),
         ('fs_attributes', 'H'),
         ('media_attributes', 'H'),
         ('length', 'Q'),
         ('_encryption_algo', 'H'),
         ('_compression_algo', 'H'),
-        ('_checksum', 'H'),
+        ('_checksum', '2s'),
     ]
     _field_struct: ClassVar = struct.Struct('<' + ' '.join(spec[1] for spec in _field_specs))
+    assert _field_struct.size == STREAM_HDR_SIZE
 
     @classmethod
     def from_bytes(cls, data: bytes) -> Self:
-        if len(data) < STREAM_HDR_SIZE:
-            raise ValueError(
-                f"Need {STREAM_HDR_SIZE} bytes for Stream Header, got {len(data)}"
-            )
+        if (size := len(data)) != (struct_size := cls._field_struct.size):
+            raise ValueError(f"Expected {struct_size} bytes for Stream Header, got {size}")
 
         fields = cls._field_struct.unpack(data)
         field_dict = {k: fields[i] for i, (k, _) in enumerate(cls._field_specs) if k}
 
         return cls(**field_dict)
+
+
+@dataclass
+class DBLK:
+    type_id: ClassVar[bytes]
+
+    header: DBHeader
+    extra_data: bytes | None
+    extra_offset: int = DB_HDR_SIZE
+
+    @classmethod
+    def from_bytes(cls, header: DBHeader, dblk_data: bytes) -> Self: ...
+
+    def __init__(self):
+        if type(self) is DBLK:
+            raise TypeError(NotImplemented)
+
+    def __len__(self) -> int:
+        if self.extra_data is None:
+            raise TypeError("No extra data in DBLK")
+        return self.extra_offset + len(self.extra_data)
+
+    @overload
+    def __getitem__(self, key: int) -> int: ...
+    @overload
+    def __getitem__(self, key: RangeSlice) -> memoryview: ...
+    def __getitem__(self, key: int | slice) -> int | memoryview:
+        if self.extra_data is None:
+            raise TypeError("No extra data in DBLK")
+        match key:
+            case int():
+                return self.extra_data[key - self.extra_offset if key >= 0 else key]
+            case slice():
+                return memoryview(self.extra_data)[_slice_offset(key, -self.extra_offset)]
+            case _:
+                assert False
+
+    def _var_field(self, offset: int, size: int) -> memoryview | None:
+        assert offset >= 0 and size >= 0
+        if offset + size > (dblk_size := len(self)):
+            raise IndexError(
+                f"Expected {size} bytes at DBLK offset {offset}, "
+                f"DBLK size {dblk_size}")
+        if size == 0:
+            return None
+        return self[offset : offset + size]
+
+@dataclass
+class UnknownDBLK(DBLK):
+    @property
+    def type_id(self) -> bytes:
+        return self.header.type_id
+
+    @classmethod
+    def from_bytes(cls, header: DBHeader, dblk_data: bytes) -> Self:
+        return cls(header, dblk_data[DB_HDR_SIZE:], extra_offset=DB_HDR_SIZE)
+
+_dblk_type_registry: dict[bytes, type[DBLK]] = dict()
+
+def register_dblk_type[Z: type[DBLK]](cls: Z) -> Z:
+    _dblk_type_registry[cls.type_id] = cls
+    return cls
+
+def parse_dblk(flb_data: bytes) -> DBLK:
+    header = DBHeader.from_bytes(flb_data[:DB_HDR_SIZE])
+    dblk_type = _dblk_type_registry.get(header.type_id, UnknownDBLK)
+    return dblk_type.from_bytes(header, flb_data[:header.next_offset])
+
+@register_dblk_type
+@dataclass(kw_only=True)
+class TapeDBLK(DBLK):
+    type_id = MTF_TAPE
+
+    media_family_id: int
+    tape_attributes: int
+    media_index: int
+    _password_encryption_algo: int
+    _sfmb_size_512: int
+    _mbc_type: int
+    _media_name_size: int
+    _media_name_offset: int
+    _media_description_size: int
+    _media_description_offset: int
+    _media_password_size: int
+    _media_password_offset: int
+    _software_name_size: int
+    _software_name_offset: int
+    flb_size: int
+    software_vendor_id: int
+    _media_date: bytes
+    _mtf_major_version: int
+
+    _field_specs: ClassVar = [
+        ('media_family_id', 'I'),
+        ('tape_attributes', 'I'),
+        ('media_index', 'H'),
+        ('_password_encryption_algo', 'H'),
+        ('_sfmb_size_512', 'H'),
+        ('_mbc_type', 'H'),
+        ('_media_name_size', 'H'),
+        ('_media_name_offset', 'H'),
+        ('_media_description_size', 'H'),
+        ('_media_description_offset', 'H'),
+        ('_media_password_size', 'H'),
+        ('_media_password_offset', 'H'),
+        ('_software_name_size', 'H'),
+        ('_software_name_offset', 'H'),
+        ('flb_size', 'H'),
+        ('software_vendor_id', 'H'),
+        ('_media_date', '5s'),
+        ('_mtf_major_version', 'B'),
+    ]
+    _field_struct: ClassVar = struct.Struct('<' + ' '.join(spec[1] for spec in _field_specs))
+    assert _field_struct.size == 94 - DB_HDR_SIZE
+
+    @property
+    def sfmb_size(self) -> int:
+        return self._sfmb_size_512 * 512
+
+    @property
+    def media_name_raw(self) -> memoryview | None:
+        return self._var_field(self._media_name_offset, self._media_name_size)
+
+    @property
+    def media_description_raw(self) -> memoryview | None:
+        return self._var_field(self._media_description_offset, self._media_description_size)
+
+    @property
+    def media_password_raw(self) -> memoryview | None:
+        return self._var_field(self._media_password_offset, self._media_password_size)
+
+    @property
+    def software_name_raw(self) -> memoryview | None:
+        return self._var_field(self._software_name_offset, self._software_name_size)
+
+    @property
+    def media_datetime(self) -> datetime | None:
+        if all(b == 0x00 for b in self._media_date):
+            return None
+        v = int.from_bytes(self._media_date, 'big')
+        second, v = v % (1 << 6), v // (1 << 6)
+        minute, v = v % (1 << 6), v // (1 << 6)
+        hour,   v = v % (1 << 5), v // (1 << 5)
+        day,    v = v % (1 << 5), v // (1 << 5)
+        month,  v = v % (1 << 4), v // (1 << 4)
+        year = v
+        return datetime(year, month, day, hour, minute, second)
+
+    @classmethod
+    def from_bytes(cls, header: DBHeader, dblk_data: bytes) -> Self:
+        assert header.type_id == cls.type_id
+
+        offset = DB_HDR_SIZE
+        fields = cls._field_struct.unpack_from(dblk_data, offset)
+        field_dict = {k: fields[i] for i, (k, _) in enumerate(cls._field_specs) if k}
+        offset += cls._field_struct.size
+
+        return cls(header, dblk_data[offset:], extra_offset=offset, **field_dict)
 
 
 @dataclass(kw_only=True)
@@ -239,10 +406,18 @@ class StreamInfo:
     """
 
     file_offset: int | None = None # absolute file offset of the Stream Header
-    stream_id: bytes       # 4-byte ASCII ('STAN', 'SPAD', 'NTEA', ...)
+    type_id: bytes       # 4-byte ASCII ('STAN', 'SPAD', 'NTEA', ...)
     length: int            # declared byte length of stream data
     fs_attributes: int = 0      # file-system-level flags (BIT0=modified, BIT1=security, …)
     media_attributes: int = 0   # continuation, checksummed, encrypted, compressed
+
+    @property
+    def type_name(self) -> str:
+        """Decoded alphanumeric stream ID for display."""
+        if self.type_id.isalnum():
+            return self.type_id.decode("ascii")
+        else:
+            return repr(self.type_id)
 
     @classmethod
     def from_header(cls,
@@ -252,26 +427,14 @@ class StreamInfo:
         """Convert to a StreamInfo pinned to a file offset."""
         return cls(
             file_offset=file_offset,
-            stream_id=header.stream_id,
+            type_id=header.type_id,
             length=header.length,
             fs_attributes=header.fs_attributes,
             media_attributes=header.media_attributes,
         )
 
-    @property
-    def is_spad(self) -> bool:
-        return self.stream_id == STREAM_PAD
-
-    @property
-    def stream_id_str(self) -> str:
-        """Decoded ASCII stream ID for display."""
-        try:
-            return self.stream_id.decode("ascii")
-        except UnicodeDecodeError:
-            return repr(self.stream_id)
-
     def __str__(self) -> str:
-        return f"{self.stream_id_str}({self.length :,})"
+        return f"{self.type_name}({self.length :,})"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -352,11 +515,11 @@ def _skip_and_collect_streams(
         # Stream data starts immediately after the 22-byte header.
         data_start = pos + STREAM_HDR_SIZE
 
-        if sh.stream_id == STREAM_PAD:
+        if sh.type_id == STREAM_PAD:
             # SPAD data fills exactly to the next FLB boundary.
             return data_start + sh.length, streams
 
-        if sh.stream_id == STREAM_CORRUPT:
+        if sh.type_id == STREAM_CORRUPT:
             raise MTFParseError(f"Corrupt stream marker at offset {pos :#x}")
 
         # Non-SPAD stream: skip header + declared data length,
