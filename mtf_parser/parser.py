@@ -22,6 +22,7 @@ from typing import Any, BinaryIO, ClassVar, Self, TextIO, overload
 from .constants import (
     DB_HDR_SIZE,
     STREAM_HDR_SIZE,
+    TAPE_HEADER_SIZE,
     MTF_TAPE,
     MTF_SSET,
     MTF_VOLB,
@@ -54,7 +55,7 @@ def _slice_offset[T: slice[int | None]](src: T, offset: int | None) -> T:
 # Data Structures
 # ═══════════════════════════════════════════════════════════════════
 
-@dataclass(kw_only=True)
+@dataclass(slots=True, kw_only=True)
 class DBHeader:
     """Parsed 52-byte Common Block Header (MTF_DB_HDR, Structure 4).
 
@@ -74,7 +75,7 @@ class DBHeader:
     _os_specific_size: int       # offset 44: uint16 — size of OS-specific data area
     _os_specific_offset: int     # offset 46: uint16 — offset to OS-specific data
     _string_type: int            # offset 48: uint8  — 0=none, 1=ANSI, 2=Unicode
-    _checksum: bytes
+    _checksum: bytes = field(repr=False)
 
     _field_specs: ClassVar = [
         ('type_id', '4s'),
@@ -117,7 +118,7 @@ class DBHeader:
 
         return cls(**field_dict)
 
-@dataclass(kw_only=True)
+@dataclass(slots=True, kw_only=True)
 class StreamHeader:
     """Parsed 22-byte Stream Header (MTF_STREAM_HDR, Structure 15).
 
@@ -130,7 +131,7 @@ class StreamHeader:
     length: int
     _encryption_algo: int
     _compression_algo: int
-    _checksum: bytes
+    _checksum: bytes = field(repr=False)
 
     _field_specs: ClassVar = [
         ('type_id', '4s'),
@@ -160,8 +161,12 @@ class DBLK:
     type_id: ClassVar[bytes]
 
     header: DBHeader
-    extra_data: bytes | None
+    extra_data: bytes | None = field(repr=False)
     extra_offset: int = DB_HDR_SIZE
+
+    @property
+    def type_name(self) -> str:
+        return DBLK_TYPE_NAMES[self.type_id]
 
     @classmethod
     def from_bytes(cls, header: DBHeader, dblk_data: bytes) -> Self: ...
@@ -205,6 +210,10 @@ class UnknownDBLK(DBLK):
     @property
     def type_id(self) -> bytes:
         return self.header.type_id
+
+    @property
+    def type_name(self) -> str:
+        return 'UNKNOWN'
 
     @classmethod
     def from_bytes(cls, header: DBHeader, dblk_data: bytes) -> Self:
@@ -266,7 +275,7 @@ class TapeDBLK(DBLK):
         ('_mtf_major_version', 'B'),
     ]
     _field_struct: ClassVar = struct.Struct('<' + ' '.join(spec[1] for spec in _field_specs))
-    assert _field_struct.size == 94 - DB_HDR_SIZE
+    assert _field_struct.size == TAPE_HEADER_SIZE - DB_HDR_SIZE
 
     @property
     def sfmb_size(self) -> int:
@@ -313,7 +322,7 @@ class TapeDBLK(DBLK):
         return cls(header, dblk_data[offset:], extra_offset=offset, **field_dict)
 
 
-@dataclass(kw_only=True)
+@dataclass(slots=True, kw_only=True)
 class DblkInfo:
     """Summary information about one parsed DBLK, including its streams."""
 
@@ -339,7 +348,7 @@ class DblkInfo:
     @classmethod
     def from_header(cls,
         header: DBHeader, streams: Sequence['StreamHeader | StreamInfo'] | None =None,
-        file_offset: int | None =None, **kwargs
+        file_offset: int | None =None, **kwargs: Any
     ) -> Self:
         stream_infos = [
                 StreamInfo.from_header(item) if isinstance(item, StreamHeader) else item
@@ -398,7 +407,7 @@ class DblkInfo:
             info_str = f"({self.display_size :,})" if self.display_size else ""
         return f"{self.type_name}{info_str}"
 
-@dataclass(kw_only=True)
+@dataclass(slots=True, kw_only=True)
 class StreamInfo:
     """Metadata about a single Data Stream associated with a DBLK.
 
@@ -461,20 +470,6 @@ def _read_exact(f: BinaryIO, size: int) -> bytes:
             f"reached end at {end :#x}"
         )
     return data
-
-
-def _read_u16_at(f: BinaryIO, pos: int) -> int:
-    """Read a little-endian uint16 at absolute file offset `pos`.
-
-    Saves and restores the current stream position.
-    """
-    saved = f.tell()
-    try:
-        f.seek(pos)
-        raw = _read_exact(f, 2)
-        return struct.unpack("<H", raw)[0]
-    finally:
-        f.seek(saved)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -548,72 +543,63 @@ def parse_mtf(
     # ── Phase 1: Read MTF_TAPE at offset 0 ──
     f.seek(0)
     try:
-        tape_raw = _read_exact(f, DB_HDR_SIZE)
+        raw_data = _read_exact(f, TAPE_HEADER_SIZE)
     except EOFError:
-        raise MTFParseError("Data is too small to contain MTF header")
+        raise MTFParseError("Reached end before complete MTF_TAPE DBLK")
 
-    tape_hdr = DBHeader.from_bytes(tape_raw)
-    if tape_hdr.type_id != MTF_TAPE:
-        raise MTFParseError(f"Expected MTF_TAPE at head, got {tape_hdr.type_name}")
-    _log.debug(f"Tape header: {tape_hdr !r}")
+    tape_dblk = parse_dblk(raw_data)
+    if tape_dblk.type_id != MTF_TAPE:
+        raise MTFParseError(f"Expected MTF_TAPE at head, got {tape_dblk.type_name}")
+    assert isinstance(tape_dblk, TapeDBLK)
+    _log.debug(f"Tape header: {tape_dblk !r}")
 
-    # Read key fields from MTF_TAPE body (offsets relative to DBLK start).
-    flb_size = _read_u16_at(f, 84)          # Format Logical Block Size
+    # Get key fields from MTF_TAPE DBLK.
+    flb_size = tape_dblk.flb_size           # Format Logical Block Size
     if flb_size not in VALID_FLB_SIZES:
         _log.error(f"Unsupported FLB size {flb_size} (expected 512 or 1024)")
+    sfmb_size = tape_dblk.sfmb_size         # Soft Filemark Block Size
 
-    sfmb_block_size = _read_u16_at(f, 64)   # Soft Filemark Block Size (× 512)
-    sfmb_byte_size = sfmb_block_size * 512
-
-    # ── Skip TAPE's streams and record them ──
-    pos, tape_streams = _skip_and_collect_streams(
-        f, tape_hdr.next_offset
-    )
-    info = DblkInfo.from_header(
-        tape_hdr, tape_streams,
-        file_offset=0,
-        flb_size=flb_size, **dict(sfmb_size=sfmb_byte_size) if sfmb_block_size else {})
-    yield info
-
-    # ── Phase 2: Traverse remaining DBLKs ──
-    indent_depth = 0
+    # ── Phase 2: Traverse through DBLKs ──
+    pos = 0
 
     for i in itertools.count(1):
         f.seek(pos)
         try:
-            raw_hdr = _read_exact(f, DB_HDR_SIZE)
+            raw_data = _read_exact(f, flb_size)
         except EOFError as error:
             _log.warning(f"Reached end when trying to parse DBLK:")
             _log.warning(error)
             break
 
-        hdr = DBHeader.from_bytes(raw_hdr)
         dblk_offset = pos
-        _log.debug(f"DBLK {i}, offset {dblk_offset :#x}: {hdr !r}")
+        dblk = parse_dblk(raw_data)
+        _log.debug(f"DBLK {i}, offset {dblk_offset :#x}: {dblk !r}")
 
-        if hdr.type_id == MTF_CFIL:
+        if dblk.type_id == MTF_CFIL:
             raise MTFParseError(f"Corrupt object DBLK at offset {dblk_offset :#x}")
 
-        # ── Skip streams (single pass: collect + advance) ──
-        is_sfmb = (hdr.type_id == MTF_SFMB)
-
-        if is_sfmb:
+        # ── Skip streams and record them ──
+        if dblk.type_id == MTF_SFMB:
             # SFMB has no data streams (Section 5.2.10).
             streams: list[StreamInfo] = []
-            pos = dblk_offset + (sfmb_byte_size if sfmb_byte_size else hdr.next_offset)
+            pos = dblk_offset + (sfmb_size if sfmb_size else dblk.header.next_offset)
         else:
             try:
-                pos, streams = _skip_and_collect_streams(f, dblk_offset + hdr.next_offset)
+                pos, streams = _skip_and_collect_streams(f, dblk_offset + dblk.header.next_offset)
             except EOFError as error:
                 _log.warning(f"Reached end when skipping streams:")
                 _log.warning(error)
                 break
 
         # ── Build DblkInfo (after streams are known) ──
-        info = DblkInfo.from_header(hdr, streams, file_offset=dblk_offset)
+        info = DblkInfo.from_header(dblk.header, streams, file_offset=dblk_offset)
+        if isinstance(dblk, TapeDBLK): # TODO: Separate
+            info.fields['flb_size'] = dblk.flb_size
+            if sfmb_size:
+                info.fields['sfmb_size'] = sfmb_size
         yield info
 
-        if hdr.type_id == MTF_EOTM:
+        if dblk.type_id == MTF_EOTM:
             _log.info("EOTM reached")
             break
 

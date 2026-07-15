@@ -50,10 +50,6 @@ STREAM_NT_QUOTA = b"NTQU"       # Disk Quota
 STREAM_NT_PROPERTY = b"NTPR"    # Property Data
 STREAM_NT_REPARSE = b"NTRP"     # Reparse Point Data
 STREAM_NT_OBJECT_ID = b"NTOI"   # Object ID Data
-STREAM_WIN95_REGISTRY = b"GERC" # Windows 95 Registry
-STREAM_NETWARE_TRUSTEE = b"N386"
-STREAM_NETWARE_BINDERY = b"NBND"
-STREAM_NETWARE_SMS = b"SMSD"
 
 # MBC streams
 STREAM_MBC_SET_MAP_TYPE1 = b"TSMP"
@@ -65,6 +61,8 @@ STREAM_MBC_FDD_TYPE2 = b"FDD2"
 
 DB_HDR_SIZE = 52       # Common Block Header (MTF_DB_HDR)
 STREAM_HDR_SIZE = 22   # Stream Header (MTF_STREAM_HDR)
+
+TAPE_HEADER_SIZE = DB_HDR_SIZE + 42
 
 # ── Format Logical Block sizes ────────────────────────────────────
 
