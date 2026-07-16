@@ -14,9 +14,9 @@ from mtf_parser.parser import (
 	DBHeader,
 	StreamHeader,
 	StreamInfo,
-	_skip_and_collect_streams,
-	parse_mtf,
 	MTFParseError,
+	parse_mtf_dblk,
+	_skip_and_collect_streams,
 )
 from mtf_parser.constants import (
 	DB_HDR_SIZE,
@@ -454,15 +454,15 @@ class TestSkipStreams:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Tests: parse_mtf (integration)
+# Tests: parse_mtf_dblk (integration)
 # ═══════════════════════════════════════════════════════════════════
 
 class TestParseMTF:
-	"""Integration tests for the full parse_mtf traversal."""
+	"""Integration tests for the full parse_mtf_dblk traversal."""
 
 	def test_minimal_bkf_512(self):
 		buf = io.BytesIO(build_minimal_bkf(FLB_512))
-		results = [*parse_mtf(buf)]
+		results = parse_mtf_dblk(buf)
 
 		assert len(results) == 3
 		assert results[0].type_name == "MTF_TAPE"
@@ -472,14 +472,14 @@ class TestParseMTF:
 
 	def test_minimal_bkf_1024(self):
 		buf = io.BytesIO(build_minimal_bkf(FLB_1024))
-		results = [*parse_mtf(buf)]
+		results = parse_mtf_dblk(buf)
 
 		assert len(results) == 3
 		assert results[2].type_name == "MTF_ESET"
 
 	def test_bkf_with_files(self):
 		buf = io.BytesIO(build_bkf_with_files(FLB_512, files=["a.txt", "b.dat"]))
-		results = [*parse_mtf(buf)]
+		results = parse_mtf_dblk(buf)
 
 		types = [r.type_name for r in results]
 		assert types == [
@@ -509,18 +509,18 @@ class TestParseMTF:
 			+ db(MTF_CFIL, fla=fla + pad_other // flb) + spad(pad_other)
 		)
 		with pytest.raises(MTFParseError, match="[Cc]orrupt"):
-			list(parse_mtf(buf))
+			parse_mtf_dblk(buf)
 
 	def test_missing_tape_header(self):
 		"""A file without MTF_TAPE at offset 0 should fail immediately."""
 		buf = io.BytesIO(b"not a tape file\x00" * 100)
 		with pytest.raises(MTFParseError, match="MTF_TAPE"):
-			list(parse_mtf(buf))
+			parse_mtf_dblk(buf)
 
 	def test_empty_file(self):
 		buf = io.BytesIO(b"")
 		with pytest.raises(MTFParseError):
-			list(parse_mtf(buf))
+			parse_mtf_dblk(buf)
 
 	def test_invalid_flb_size(self, caplog):
 		"""An MTF_TAPE with an unsupported FLB size should cause warning."""
@@ -528,7 +528,7 @@ class TestParseMTF:
 		spad = make_stream_header(STREAM_PAD, length=0)
 		buf = io.BytesIO(tape + spad)
 		with caplog.at_level(logging.WARNING):
-			list(parse_mtf(buf))
+			parse_mtf_dblk(buf)
 		assert "FLB" in caplog.text
 
 
@@ -542,7 +542,7 @@ class TestSFMB:
 	def test_bkf_with_sfmb_parses(self):
 		"""A file with SFMB blocks between Data Sets should parse cleanly."""
 		buf = io.BytesIO(build_bkf_with_sfmb(FLB_512))
-		results = [*parse_mtf(buf)]
+		results = parse_mtf_dblk(buf)
 
 		types = [r.type_name for r in results]
 		assert types == [
@@ -559,7 +559,7 @@ class TestSFMB:
 	def test_sfmb_offsets(self):
 		"""SFMB blocks should advance by exactly sfmb_byte_size bytes."""
 		buf = io.BytesIO(build_bkf_with_sfmb(FLB_512))
-		results = [*parse_mtf(buf)]
+		results = parse_mtf_dblk(buf)
 
 		sfmb0 = results[3]  # first SFMB
 		sfmb1 = results[4]  # second SFMB
@@ -570,7 +570,7 @@ class TestSFMB:
 	#def test_sfmb_after_data_set(self):
 	# 	"""Verify SFMB appears after ESET in the expected layout."""
 	# 	buf = io.BytesIO(build_bkf_with_sfmb(FLB_512))
-	# 	results = [*parse_mtf(buf)]
+	# 	results = parse_mtf_dblk(buf)
 
 	# 	# ESET should be immediately followed by SFMB (no gap)
 	# 	eset = results[2]

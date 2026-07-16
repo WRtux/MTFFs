@@ -528,7 +528,8 @@ def _skip_and_collect_streams(
 # Main traversal
 # ═══════════════════════════════════════════════════════════════════
 
-def parse_mtf(
+# Structural parser
+def mtf_dblk_parser(
 	f: BinaryIO
 ) -> Iterator[DblkInfo]:
 	"""Parse an MTF (BKF) file and return a list of DBLK info records.
@@ -605,6 +606,12 @@ def parse_mtf(
 
 	_log.info(f"Parsed DBLKs: {i}")
 
+def parse_mtf_dblk(
+	f: BinaryIO
+) -> list[DblkInfo]:
+	return list(mtf_dblk_parser(f))
+
+# TODO: Semantic parser (build on parsed MTF DBLKs)
 
 # ═══════════════════════════════════════════════════════════════════
 # Output helpers
@@ -623,7 +630,7 @@ _dblk_level_map = {
 	MTF_SFMB: 0,
 }
 
-def inspect_mtf_streaming(src: Iterable[DblkInfo], stream: TextIO | None =None) -> Iterator[DblkInfo]:
+def inspect_mtf_dblk_streaming(src: Iterable[DblkInfo], stream: TextIO | None =None) -> Iterator[DblkInfo]:
 	prev_level = 0
 	for dblk_info in src:
 		level = _dblk_level_map.get(dblk_info.type_id, None)
@@ -635,6 +642,6 @@ def inspect_mtf_streaming(src: Iterable[DblkInfo], stream: TextIO | None =None) 
 		yield dblk_info
 		prev_level = level
 
-def inspect_mtf(dblks: Iterable[DblkInfo], stream: TextIO | None =None) -> None:
-	for _ in inspect_mtf_streaming(dblks, stream):
+def inspect_mtf_dblk(dblks: Iterable[DblkInfo], stream: TextIO | None =None) -> None:
+	for _ in inspect_mtf_dblk_streaming(dblks, stream):
 		pass
