@@ -19,16 +19,16 @@ MTF_EOTM = b"EOTM"  # End of Tape Marker
 MTF_SFMB = b"SFMB"  # Soft Filemark
 
 DBLK_TYPE_NAMES: dict[bytes, str] = {
-    MTF_TAPE: "MTF_TAPE",
-    MTF_SSET: "MTF_SSET",
-    MTF_VOLB: "MTF_VOLB",
-    MTF_DIRB: "MTF_DIRB",
-    MTF_FILE: "MTF_FILE",
-    MTF_CFIL: "MTF_CFIL",
-    MTF_ESPB: "MTF_ESPB",
-    MTF_ESET: "MTF_ESET",
-    MTF_EOTM: "MTF_EOTM",
-    MTF_SFMB: "MTF_SFMB",
+	MTF_TAPE: "MTF_TAPE",
+	MTF_SSET: "MTF_SSET",
+	MTF_VOLB: "MTF_VOLB",
+	MTF_DIRB: "MTF_DIRB",
+	MTF_FILE: "MTF_FILE",
+	MTF_CFIL: "MTF_CFIL",
+	MTF_ESPB: "MTF_ESPB",
+	MTF_ESET: "MTF_ESET",
+	MTF_EOTM: "MTF_EOTM",
+	MTF_SFMB: "MTF_SFMB",
 }
 
 # ── Stream Type IDs ───────────────────────────────────────────────

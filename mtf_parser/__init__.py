@@ -3,10 +3,10 @@
 from .parser import parse_mtf, MTFParseError, DBHeader, StreamHeader, StreamInfo, DblkInfo
 
 __all__ = [
-    "parse_mtf",
-    "MTFParseError",
-    "DBHeader",
-    "StreamHeader",
-    "StreamInfo",
-    "DblkInfo",
+	"parse_mtf",
+	"MTFParseError",
+	"DBHeader",
+	"StreamHeader",
+	"StreamInfo",
+	"DblkInfo",
 ]
