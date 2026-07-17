@@ -17,7 +17,7 @@ import struct
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, BinaryIO, ClassVar, Self, TextIO, overload
+from typing import BinaryIO, ClassVar, Self, TextIO, overload
 
 from .constants import (
 	DB_HDR_SIZE,
@@ -168,6 +168,15 @@ class DBLK:
 	def type_name(self) -> str:
 		return DBLK_TYPE_NAMES[self.type_id]
 
+	@property
+	def display_size(self) -> int | None:
+		return self.header.display_size if self.header.display_size else None
+
+	_info_specs: ClassVar[Sequence[tuple[str, str, str | None]]] = [
+		# NOTE Displayable size also observed in: SSET SFMB
+		('display_size', 'display_size', ',d'),
+	]
+
 	@classmethod
 	def from_bytes(cls, header: DBHeader, dblk_data: bytes) -> Self: ...
 
@@ -193,7 +202,7 @@ class DBLK:
 			case slice():
 				return memoryview(self.extra_data)[_slice_offset(key, -self.extra_offset)]
 			case _:
-				assert False
+				raise TypeError
 
 	def _var_field(self, offset: int, size: int) -> memoryview | None:
 		assert offset >= 0 and size >= 0
@@ -278,12 +287,16 @@ class TapeDBLK(DBLK):
 	assert _field_struct.size == TAPE_HEADER_SIZE - DB_HDR_SIZE
 
 	@property
-	def sfmb_size(self) -> int:
-		return self._sfmb_size_512 * 512
+	def sfmb_size(self) -> int | None:
+		return self._sfmb_size_512 * 512 if self._sfmb_size_512 else None
 
 	@property
 	def media_name_raw(self) -> memoryview | None:
 		return self._var_field(self._media_name_offset, self._media_name_size)
+	@property
+	def media_name(self) -> str | None:
+		raw = self.media_name_raw
+		return bytes(raw).decode('utf-16-le' if self.header._string_type == 2 else 'ascii') if raw is not None else None
 
 	@property
 	def media_description_raw(self) -> memoryview | None:
@@ -310,9 +323,18 @@ class TapeDBLK(DBLK):
 		year = v
 		return datetime(year, month, day, hour, minute, second)
 
+	_info_specs = [
+		('media_family_id', 'media_family', '#010x'),
+		('media_index', 'media_index', 'd'),
+		('media_name', 'name', '!s'),
+		('flb_size', 'FLB_size', 'd'),
+		('sfmb_size', 'SFMB_size', 'd'),
+	]
+
 	@classmethod
 	def from_bytes(cls, header: DBHeader, dblk_data: bytes) -> Self:
-		assert header.type_id == cls.type_id
+		if header.type_id != cls.type_id:
+			raise TypeError
 
 		offset = DB_HDR_SIZE
 		fields = cls._field_struct.unpack_from(dblk_data, offset)
@@ -322,6 +344,7 @@ class TapeDBLK(DBLK):
 		return cls(header, dblk_data[offset:], extra_offset=offset, **field_dict)
 
 
+# TODO Next: Make info classes for debug use only; move them to a separate file
 @dataclass(slots=True, kw_only=True)
 class DblkInfo:
 	"""Summary information about one parsed DBLK, including its streams."""
@@ -329,10 +352,10 @@ class DblkInfo:
 	file_offset: int | None = None
 	type_id: bytes
 	fla: int
-	display_size: int = 0
 	control_block_id: int = 0
 
-	fields: dict[str, Any] = field(default_factory=dict)
+	fields: dict[str, bool | int | object] = field(default_factory=dict)
+	_field_format_specs: dict[str, str | None] = field(default_factory=dict, compare=False)
 
 	streams: list['StreamInfo'] | None = field(default_factory=list)
 
@@ -348,7 +371,7 @@ class DblkInfo:
 	@classmethod
 	def from_header(cls,
 		header: DBHeader, streams: Sequence['StreamHeader | StreamInfo'] | None =None,
-		file_offset: int | None =None, **kwargs: Any
+		file_offset: int | None =None, **kwargs: bool | int | object
 	) -> Self:
 		stream_infos = [
 				StreamInfo.from_header(item) if isinstance(item, StreamHeader) else item
@@ -359,9 +382,9 @@ class DblkInfo:
 			file_offset=file_offset,
 			type_id=header.type_id,
 			fla=header.format_logical_address,
-			display_size=header.display_size,
 			control_block_id=header.control_block_id,
 			fields={ 'is_continuation': header.is_continuation, **kwargs },
+			_field_format_specs={ 'is_continuation': None },
 			streams=stream_infos
 		)
 
@@ -369,25 +392,27 @@ class DblkInfo:
 		fields, flags = [], []
 		streams = None
 
-		if self.type_id == MTF_TAPE:
-			fields.append(f"FLB_size={self.fields['flb_size']}")
-			if 'sfmb_size' in self.fields:
-				fields.append(f"SFMB_size={self.fields['sfmb_size']}")
-			# TODO
-		else:
-			if self.file_offset is not None:
-				fields.append(f"offset={self.file_offset :#x}")
-			fields.append(f"cb_id={self.control_block_id}")
-			if self.type_id not in {MTF_ESET, MTF_SFMB, MTF_EOTM}:
-				fields.append(f"FLA={self.fla}")
-			if self.type_id == MTF_FILE or self.display_size != 0:
-				fields.append(f"size={self.display_size :,}")
-			if self.fields.get('is_continuation', False):
-				flags.append("cont")
-			# TODO
+		if self.file_offset is not None:
+			fields.append(f"offset={self.file_offset :#x}")
+		if self.type_id not in {MTF_TAPE, MTF_EOTM}:
+			fields.append(f"CB={self.control_block_id}")
+			fields.append(f"FLA={self.fla}")
+
+		for key, value in self.fields.items():
+			format_spec = self._field_format_specs.get(key, '!r')
+			if format_spec is not None:
+				value = (
+					repr(value) if format_spec == '!r' else
+					repr(str(value)) if format_spec == '!s' else
+					format(value, format_spec))
+				fields.append(f"{key}={value}")
+			else:
+				assert isinstance(value, int), f"Flag field {key !r} is not boolean"
+				if value:
+					flags.append(key.removeprefix('is_'))
 
 		if self.streams is not None:
-			streams = [str(stream) for stream in self.streams]
+			streams = [repr(stream) for stream in self.streams]
 
 		field_str = ' '.join(fields) if fields else None
 		flag_str = ','.join(flags) if flags else None
@@ -396,16 +421,8 @@ class DblkInfo:
 		return (f"<{self.type_name}"
 			+ (f" {field_str}" if field_str is not None else '')
 			+ (f" [{flag_str}]" if flag_str is not None else '')
-			+ (f" | {stream_str}" if stream_str is not None else '')
-			+ ">")
-
-	def __str__(self) -> str:
-		if self.type_id in {MTF_VOLB, MTF_DIRB, MTF_FILE}:
-			name = "?" # TODO
-			info_str = f"({name !r} {self.display_size :,})"
-		else:
-			info_str = f"({self.display_size :,})" if self.display_size else ""
-		return f"{self.type_name}{info_str}"
+			+ ">"
+			+ (f"\n {stream_str}" if stream_str is not None else ''))
 
 @dataclass(slots=True, kw_only=True)
 class StreamInfo:
@@ -442,7 +459,8 @@ class StreamInfo:
 			media_attributes=header.media_attributes,
 		)
 
-	def __str__(self) -> str:
+	def __repr__(self) -> str:
+		# TODO: Name streams
 		return f"{self.type_name}({self.length :,})"
 
 
@@ -593,11 +611,14 @@ def mtf_dblk_parser(
 				break
 
 		# ── Build DblkInfo (after streams are known) ──
+		# TODO: Separate general info generation interface
 		info = DblkInfo.from_header(dblk.header, streams, file_offset=dblk_offset)
-		if isinstance(dblk, TapeDBLK): # TODO: Separate
-			info.fields['flb_size'] = dblk.flb_size
-			if sfmb_size:
-				info.fields['sfmb_size'] = sfmb_size
+		for spec in dblk._info_specs:
+			value = getattr(dblk, spec[0])
+			if value is None and spec[2] != '!r':
+				continue
+			info.fields[spec[1]] = value
+			info._field_format_specs[spec[1]] = spec[2]
 		yield info
 
 		if dblk.type_id == MTF_EOTM:
@@ -633,11 +654,13 @@ _dblk_level_map = {
 def inspect_mtf_dblk_streaming(src: Iterable[DblkInfo], stream: TextIO | None =None) -> Iterator[DblkInfo]:
 	prev_level = 0
 	for dblk_info in src:
-		level = _dblk_level_map.get(dblk_info.type_id, None)
+		level = _dblk_level_map.get(dblk_info.type_id, -1)
 		level = prev_level if level == -1 else level
 
-		line = ("  " * level if level is not None else "? ") + repr(dblk_info)
-		print(line, file=stream)
+		indent = "  " * level
+		info = repr(dblk_info)
+		out = '\n'.join(indent + line for line in info.splitlines())
+		print(out, file=stream)
 
 		yield dblk_info
 		prev_level = level
