@@ -42,9 +42,12 @@ from .constants import (
 
 type RangeSlice = slice[int | None, int | None, None]
 
+type StructFieldSpec = tuple[str | None, str] # TODO: Employ
+type InfoFieldSpec = tuple[str, str, str | None]
+
 _log = logging.getLogger(__name__)
 
-def _slice_offset[T: slice[int | None]](src: T, offset: int | None) -> T:
+def _slice_offset[T: slice[int | None]](src: T, offset: int | None) -> T: # BUG: Offset-ed values may drop below 0
 	if offset is None:
 		return src
 	start = src.start + offset if src.start is not None and src.start >= 0 else src.start
@@ -106,6 +109,10 @@ class DBHeader:
 	def is_continuation(self) -> bool:
 		"""BIT0: this DBLK is a continuation from a previous medium."""
 		return bool(self.block_attributes & 0x00000001)
+
+	@property
+	def _string_encoding(self) -> str | None:
+		return { 0: None, 1: 'ascii', 2: 'utf-16-le' }[self._string_type]
 
 	@classmethod
 	def from_bytes(cls, data: bytes) -> Self:
@@ -172,7 +179,7 @@ class DBLK:
 	def display_size(self) -> int | None:
 		return self.header.display_size if self.header.display_size else None
 
-	_info_specs: ClassVar[Sequence[tuple[str, str, str | None]]] = [
+	_info_specs: ClassVar[Sequence[InfoFieldSpec]] = [
 		# NOTE Displayable size also observed in: SSET SFMB
 		('display_size', 'display_size', ',d'),
 	]
@@ -210,9 +217,13 @@ class DBLK:
 			raise IndexError(
 				f"Expected {size} bytes at DBLK offset {offset}, "
 				f"DBLK size {dblk_size}")
-		if size == 0:
+		if offset == 0 and size == 0:
 			return None
 		return self[offset : offset + size]
+
+	def _str_field(self, offset: int, size: int) -> str | None:
+		buf = self._var_field(offset, size)
+		return str(buf, self.header._string_encoding or 'none') if buf is not None else None
 
 @dataclass
 class UnknownDBLK(DBLK):
@@ -295,12 +306,14 @@ class TapeDBLK(DBLK):
 		return self._var_field(self._media_name_offset, self._media_name_size)
 	@property
 	def media_name(self) -> str | None:
-		raw = self.media_name_raw
-		return bytes(raw).decode('utf-16-le' if self.header._string_type == 2 else 'ascii') if raw is not None else None
+		return self._str_field(self._media_name_offset, self._media_name_size)
 
 	@property
 	def media_description_raw(self) -> memoryview | None:
 		return self._var_field(self._media_description_offset, self._media_description_size)
+	@property
+	def media_description(self) -> str | None:
+		return self._str_field(self._media_description_offset, self._media_description_size)
 
 	@property
 	def media_password_raw(self) -> memoryview | None:
@@ -309,6 +322,9 @@ class TapeDBLK(DBLK):
 	@property
 	def software_name_raw(self) -> memoryview | None:
 		return self._var_field(self._software_name_offset, self._software_name_size)
+	@property
+	def software_name(self) -> str | None:
+		return self._str_field(self._software_name_offset, self._software_name_size)
 
 	@property
 	def media_datetime(self) -> datetime | None:
@@ -327,6 +343,8 @@ class TapeDBLK(DBLK):
 		('media_family_id', 'media_family', '#010x'),
 		('media_index', 'media_index', 'd'),
 		('media_name', 'name', '!s'),
+		('media_description', 'desc', '!s'),
+		('software_name', 'software', '!s'),
 		('flb_size', 'FLB_size', 'd'),
 		('sfmb_size', 'SFMB_size', 'd'),
 	]
