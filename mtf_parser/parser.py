@@ -13,11 +13,12 @@ Parsing strategy (linear traversal, no filemarks on disk):
 
 import itertools
 import logging
-import struct
+import warnings
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import BinaryIO, ClassVar, Self, TextIO, overload
+from struct import Struct
+from typing import Any, BinaryIO, ClassVar, Protocol, Self, TextIO, overload
 
 from .constants import (
 	DB_HDR_SIZE,
@@ -42,8 +43,11 @@ from .constants import (
 
 type RangeSlice = slice[int | None, int | None, None]
 
-type StructFieldSpec = tuple[str | None, str] # TODO: Employ
-type InfoFieldSpec = tuple[str, str, str | None]
+type StructFieldSpec = Sequence[tuple[str | None, str]]
+
+type InfoFieldSpec = Sequence[tuple[str, str, str | None]]
+type InfoValue = bool | int | object
+type InfoFormatSpec = str | None
 
 _log = logging.getLogger(__name__)
 
@@ -54,12 +58,55 @@ def _slice_offset[T: slice[int | None]](src: T, offset: int | None) -> T: # BUG:
 	stop = src.stop + offset if src.stop is not None and src.stop >= 0 else src.stop
 	return slice(start, stop, src.step) # type: ignore
 
+# Protocols
+
+class Structured(Protocol):
+	_field_specs: ClassVar[StructFieldSpec]
+	_field_struct: ClassVar[Struct]
+
+	@classmethod
+	def from_bytes(cls, data: bytes) -> Self: ...
+
+	@classmethod
+	def __init_subclass__(cls) -> None:
+		super().__init_subclass__()
+		if not hasattr(cls, '_field_struct'):
+			cls._field_struct = Struct('<' + ' '.join(format_def for _, format_def in cls._field_specs))
+
+	@classmethod
+	def _unpack_field_map(cls, data: bytes, from_offset: int | None =None) -> dict[str, Any]:
+		fields = (
+			cls._field_struct.unpack(data) if from_offset is None else
+			cls._field_struct.unpack_from(data, from_offset))
+		return {key: fields[i] for i, (key, _) in enumerate(cls._field_specs) if key}
+
+class InfoExtractable(Protocol):
+	_info_specs: ClassVar[InfoFieldSpec]
+
+	def _extract_info(self) -> dict[str, tuple[InfoValue, InfoFormatSpec]]:
+		info_map = dict[str, tuple[InfoValue, InfoFormatSpec]]()
+		for attr, name, format_spec in self._info_specs:
+			guard = object()
+			value = getattr(self, attr, guard)
+			if value is guard:
+				warnings.warn(f"No attribute {attr !r} to extract {name !r}")
+				continue
+			if value is None and format_spec != '!r':
+				continue
+			if format_spec is None and not isinstance(value, int):
+				warnings.warn(f"Attribute {attr !r} is not boolean")
+			info_map[name] = (value, format_spec)
+		return info_map
+
+	def _extract_info_values(self) -> dict[str, InfoValue]:
+		return {name: value for name, (value, _) in self._extract_info().items()}
+
 # ═══════════════════════════════════════════════════════════════════
 # Data Structures
 # ═══════════════════════════════════════════════════════════════════
 
 @dataclass(slots=True, kw_only=True)
-class DBHeader:
+class DBHeader(InfoExtractable, Structured):
 	"""Parsed 52-byte Common Block Header (MTF_DB_HDR, Structure 4).
 
 	All DBLKs begin with this header.  Multi-byte integers are
@@ -80,7 +127,7 @@ class DBHeader:
 	_string_type: int            # offset 48: uint8  — 0=none, 1=ANSI, 2=Unicode
 	_checksum: bytes = field(repr=False)
 
-	_field_specs: ClassVar = [
+	_field_specs = [
 		('type_id', '4s'),
 		('block_attributes', 'I'),
 		('next_offset', 'H'),
@@ -89,17 +136,15 @@ class DBHeader:
 		('display_size', 'Q'),
 		('format_logical_address', 'Q'),
 		('_reserved_mbc', 'H'),
-		('', '6s'),
+		(None, '6s'),
 		('control_block_id', 'I'),
-		('', '4s'),
+		(None, '4s'),
 		('_os_specific_size', 'H'),
 		('_os_specific_offset', 'H'),
 		('_string_type', 'B'),
-		('', '1s'),
+		(None, '1s'),
 		('_checksum', '2s'),
 	]
-	_field_struct: ClassVar = struct.Struct('<' + ' '.join(spec[1] for spec in _field_specs))
-	assert _field_struct.size == DB_HDR_SIZE
 
 	@property
 	def type_name(self) -> str:
@@ -114,19 +159,27 @@ class DBHeader:
 	def _string_encoding(self) -> str | None:
 		return { 0: None, 1: 'ascii', 2: 'utf-16-le' }[self._string_type]
 
+	_info_specs = [
+		('type_id', 'type', '!r'),
+		('control_block_id', 'CB', 'd'),
+		('format_logical_address', 'FLA', 'd'),
+		('is_continuation', 'is_continuation', None),
+		# TODO: Other block attributes
+	]
+
 	@classmethod
 	def from_bytes(cls, data: bytes) -> Self:
 		"""Unpack a 52-byte Common Block Header."""
 		if (size := len(data)) != (struct_size := cls._field_struct.size):
 			raise ValueError(f"Expected {struct_size} bytes for DB_HDR, got {size}")
 
-		fields = cls._field_struct.unpack(data)
-		field_dict = {k: fields[i] for i, (k, _) in enumerate(cls._field_specs) if k}
+		field_map = cls._unpack_field_map(data)
+		return cls(**field_map)
 
-		return cls(**field_dict)
+assert DBHeader._field_struct.size == DB_HDR_SIZE
 
 @dataclass(slots=True, kw_only=True)
-class StreamHeader:
+class StreamHeader(Structured):
 	"""Parsed 22-byte Stream Header (MTF_STREAM_HDR, Structure 15).
 
 	Internal use — callers interact with StreamInfo.
@@ -140,7 +193,7 @@ class StreamHeader:
 	_compression_algo: int
 	_checksum: bytes = field(repr=False)
 
-	_field_specs: ClassVar = [
+	_field_specs = [
 		('type_id', '4s'),
 		('fs_attributes', 'H'),
 		('media_attributes', 'H'),
@@ -149,22 +202,20 @@ class StreamHeader:
 		('_compression_algo', 'H'),
 		('_checksum', '2s'),
 	]
-	_field_struct: ClassVar = struct.Struct('<' + ' '.join(spec[1] for spec in _field_specs))
-	assert _field_struct.size == STREAM_HDR_SIZE
 
 	@classmethod
 	def from_bytes(cls, data: bytes) -> Self:
 		if (size := len(data)) != (struct_size := cls._field_struct.size):
 			raise ValueError(f"Expected {struct_size} bytes for Stream Header, got {size}")
 
-		fields = cls._field_struct.unpack(data)
-		field_dict = {k: fields[i] for i, (k, _) in enumerate(cls._field_specs) if k}
+		field_map = cls._unpack_field_map(data)
+		return cls(**field_map)
 
-		return cls(**field_dict)
+assert StreamHeader._field_struct.size == STREAM_HDR_SIZE
 
 
 @dataclass
-class DBLK:
+class DBLK(InfoExtractable):
 	type_id: ClassVar[bytes]
 
 	header: DBHeader
@@ -176,12 +227,18 @@ class DBLK:
 		return DBLK_TYPE_NAMES[self.type_id]
 
 	@property
-	def display_size(self) -> int | None:
+	def _display_size(self) -> int | None:
+		# NOTE: May not have meaning in many types
 		return self.header.display_size if self.header.display_size else None
 
-	_info_specs: ClassVar[Sequence[InfoFieldSpec]] = [
+	@property
+	def _os_specific_data(self) -> memoryview | None:
+		return self._var_field(self.header._os_specific_offset, self.header._os_specific_size)
+
+	_info_specs = [
+		('type_id', 'type', '!r'),
+		('_display_size', 'display_size?', ',d'), # Guard if not none
 		# NOTE Displayable size also observed in: SSET SFMB
-		('display_size', 'display_size', ',d'),
 	]
 
 	@classmethod
@@ -225,6 +282,11 @@ class DBLK:
 		buf = self._var_field(offset, size)
 		return str(buf, self.header._string_encoding or 'none') if buf is not None else None
 
+	def _extract_info(self) -> dict[str, tuple[InfoValue, InfoFormatSpec]]:
+		info_map = self.header._extract_info()
+		info_map.update(super()._extract_info())
+		return info_map
+
 @dataclass
 class UnknownDBLK(DBLK):
 	@property
@@ -252,7 +314,7 @@ def parse_dblk(flb_data: bytes) -> DBLK:
 
 @register_dblk_type
 @dataclass(kw_only=True)
-class TapeDBLK(DBLK):
+class TapeDBLK(DBLK, Structured):
 	type_id = MTF_TAPE
 
 	media_family_id: int
@@ -274,7 +336,7 @@ class TapeDBLK(DBLK):
 	_media_date: bytes
 	_mtf_major_version: int
 
-	_field_specs: ClassVar = [
+	_field_specs = [
 		('media_family_id', 'I'),
 		('tape_attributes', 'I'),
 		('media_index', 'H'),
@@ -294,8 +356,6 @@ class TapeDBLK(DBLK):
 		('_media_date', '5s'),
 		('_mtf_major_version', 'B'),
 	]
-	_field_struct: ClassVar = struct.Struct('<' + ' '.join(spec[1] for spec in _field_specs))
-	assert _field_struct.size == TAPE_HEADER_SIZE - DB_HDR_SIZE
 
 	@property
 	def sfmb_size(self) -> int | None:
@@ -340,6 +400,7 @@ class TapeDBLK(DBLK):
 		return datetime(year, month, day, hour, minute, second)
 
 	_info_specs = [
+		('type_id', 'type', '!r'),
 		('media_family_id', 'media_family', '#010x'),
 		('media_index', 'media_index', 'd'),
 		('media_name', 'name', '!s'),
@@ -355,11 +416,17 @@ class TapeDBLK(DBLK):
 			raise TypeError
 
 		offset = DB_HDR_SIZE
-		fields = cls._field_struct.unpack_from(dblk_data, offset)
-		field_dict = {k: fields[i] for i, (k, _) in enumerate(cls._field_specs) if k}
+		field_map = cls._unpack_field_map(dblk_data, offset)
 		offset += cls._field_struct.size
 
-		return cls(header, dblk_data[offset:], extra_offset=offset, **field_dict)
+		return cls(header, dblk_data[offset:], extra_offset=offset, **field_map)
+
+	def _extract_info(self) -> dict[str, tuple[InfoValue, InfoFormatSpec]]:
+		info_map = super()._extract_info()
+		del info_map['CB'], info_map['FLA']
+		return info_map
+
+assert TapeDBLK._field_struct.size == TAPE_HEADER_SIZE - DB_HDR_SIZE
 
 
 # TODO Next: Make info classes for debug use only; move them to a separate file
@@ -369,11 +436,9 @@ class DblkInfo:
 
 	file_offset: int | None = None
 	type_id: bytes
-	fla: int
-	control_block_id: int = 0
 
-	fields: dict[str, bool | int | object] = field(default_factory=dict)
-	_field_format_specs: dict[str, str | None] = field(default_factory=dict, compare=False)
+	fields: dict[str, InfoValue] = field(default_factory=dict)
+	_field_format_specs: dict[str, InfoFormatSpec] = field(default_factory=dict, compare=False)
 
 	streams: list['StreamInfo'] | None = field(default_factory=list)
 
@@ -389,7 +454,7 @@ class DblkInfo:
 	@classmethod
 	def from_header(cls,
 		header: DBHeader, streams: Sequence['StreamHeader | StreamInfo'] | None =None,
-		file_offset: int | None =None, **kwargs: bool | int | object
+		file_offset: int | None =None, **kwargs: InfoValue
 	) -> Self:
 		stream_infos = [
 				StreamInfo.from_header(item) if isinstance(item, StreamHeader) else item
@@ -399,8 +464,6 @@ class DblkInfo:
 		return cls(
 			file_offset=file_offset,
 			type_id=header.type_id,
-			fla=header.format_logical_address,
-			control_block_id=header.control_block_id,
 			fields={ 'is_continuation': header.is_continuation, **kwargs },
 			_field_format_specs={ 'is_continuation': None },
 			streams=stream_infos
@@ -412,12 +475,13 @@ class DblkInfo:
 
 		if self.file_offset is not None:
 			fields.append(f"offset={self.file_offset :#x}")
-		if self.type_id not in {MTF_TAPE, MTF_EOTM}:
-			fields.append(f"CB={self.control_block_id}")
-			fields.append(f"FLA={self.fla}")
 
 		for key, value in self.fields.items():
 			format_spec = self._field_format_specs.get(key, '!r')
+
+			if key == 'type':
+				continue
+
 			if format_spec is not None:
 				value = (
 					repr(value) if format_spec == '!r' else
@@ -425,7 +489,6 @@ class DblkInfo:
 					format(value, format_spec))
 				fields.append(f"{key}={value}")
 			else:
-				assert isinstance(value, int), f"Flag field {key !r} is not boolean"
 				if value:
 					flags.append(key.removeprefix('is_'))
 
@@ -631,12 +694,9 @@ def mtf_dblk_parser(
 		# ── Build DblkInfo (after streams are known) ──
 		# TODO: Separate general info generation interface
 		info = DblkInfo.from_header(dblk.header, streams, file_offset=dblk_offset)
-		for spec in dblk._info_specs:
-			value = getattr(dblk, spec[0])
-			if value is None and spec[2] != '!r':
-				continue
-			info.fields[spec[1]] = value
-			info._field_format_specs[spec[1]] = spec[2]
+		info_map = dblk._extract_info()
+		info.fields.update({name: value for name, (value, format_spec) in info_map.items()})
+		info._field_format_specs.update({name: format_spec for name, (value, format_spec) in info_map.items()})
 		yield info
 
 		if dblk.type_id == MTF_EOTM:
