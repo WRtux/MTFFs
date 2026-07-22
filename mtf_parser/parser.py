@@ -14,7 +14,7 @@ Parsing strategy (linear traversal, no filemarks on disk):
 import itertools
 import logging
 import warnings
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Buffer, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from struct import Struct
@@ -35,8 +35,12 @@ from .constants import (
 	MTF_EOTM,
 	MTF_SFMB,
 	DBLK_TYPE_NAMES,
-	STREAM_PAD,
+	STREAM_STANDARD,
+	STREAM_PATH_NAME,
+	STREAM_FILE_NAME,
+	STREAM_CHECKSUM,
 	STREAM_CORRUPT,
+	STREAM_PAD,
 	VALID_FLB_SIZES,
 )
 
@@ -51,21 +55,45 @@ type InfoFormatSpec = str | None
 
 _log = logging.getLogger(__name__)
 
-def _slice_offset[T: slice[int | None]](src: T, offset: int | None) -> T: # BUG: Offset-ed values may drop below 0
+def _slice_offset[T: slice[int | None]](src: T, offset: int | None) -> T:
 	if offset is None:
 		return src
-	start = src.start + offset if src.start is not None and src.start >= 0 else src.start
-	stop = src.stop + offset if src.stop is not None and src.stop >= 0 else src.stop
+
+	start, stop = src.start, src.stop
+	if start is not None and start >= 0:
+		start += offset
+		if start < 0:
+			raise IndexError(f"Slice start index out of range: {start}")
+	if stop is not None and stop >= 0:
+		stop += offset
+		if stop < 0:
+			raise IndexError(f"Slice stop index out of range: {stop}")
 	return slice(start, stop, src.step) # type: ignore
 
+def _parse_datetime(data: Buffer) -> datetime | None:
+	data = bytes(data)
+	assert len(data) == 5
+
+	v = int.from_bytes(data, 'big')
+	if v == 0:
+		return None
+	second, v = v % (1 << 6), v // (1 << 6)
+	minute, v = v % (1 << 6), v // (1 << 6)
+	hour,   v = v % (1 << 5), v // (1 << 5)
+	day,    v = v % (1 << 5), v // (1 << 5)
+	month,  v = v % (1 << 4), v // (1 << 4)
+	year = v
+	return datetime(year, month, day, hour, minute, second)
+
 # Protocols
+# TODO: Separate
 
 class Structured(Protocol):
 	_field_specs: ClassVar[StructFieldSpec]
 	_field_struct: ClassVar[Struct]
 
 	@classmethod
-	def from_bytes(cls, data: bytes) -> Self: ...
+	def from_bytes(cls, data: bytes, *args) -> Self: ...
 
 	@classmethod
 	def __init_subclass__(cls) -> None:
@@ -74,7 +102,7 @@ class Structured(Protocol):
 			cls._field_struct = Struct('<' + ' '.join(format_def for _, format_def in cls._field_specs))
 
 	@classmethod
-	def _unpack_field_map(cls, data: bytes, from_offset: int | None =None) -> dict[str, Any]:
+	def _unpack_field_map(cls, data: Buffer, from_offset: int | None =None) -> dict[str, Any]:
 		fields = (
 			cls._field_struct.unpack(data) if from_offset is None else
 			cls._field_struct.unpack_from(data, from_offset))
@@ -93,8 +121,10 @@ class InfoExtractable(Protocol):
 				continue
 			if value is None and format_spec != '!r':
 				continue
-			if format_spec is None and not isinstance(value, int):
-				warnings.warn(f"Attribute {attr !r} is not boolean")
+			if format_spec is None:
+				if not isinstance(value, int):
+					warnings.warn(f"Attribute {attr !r} is not boolean: {value !r}")
+				value = bool(value)
 			info_map[name] = (value, format_spec)
 		return info_map
 
@@ -127,6 +157,19 @@ class DBHeader(InfoExtractable, Structured):
 	_string_type: int            # offset 48: uint8  — 0=none, 1=ANSI, 2=Unicode
 	_checksum: bytes = field(repr=False)
 
+	@property
+	def type_name(self) -> str:
+		return DBLK_TYPE_NAMES.get(self.type_id, 'UNKNOWN')
+
+	@property
+	def is_continuation(self) -> bool:
+		"""BIT0: this DBLK is a continuation from a previous medium."""
+		return bool(self.block_attributes & 0x00000001)
+
+	@property
+	def _string_encoding(self) -> str | None:
+		return { 0: None, 1: 'ascii', 2: 'utf-16-le' }[self._string_type]
+
 	_field_specs = [
 		('type_id', '4s'),
 		('block_attributes', 'I'),
@@ -145,19 +188,6 @@ class DBHeader(InfoExtractable, Structured):
 		(None, '1s'),
 		('_checksum', '2s'),
 	]
-
-	@property
-	def type_name(self) -> str:
-		return DBLK_TYPE_NAMES.get(self.type_id, 'UNKNOWN')
-
-	@property
-	def is_continuation(self) -> bool:
-		"""BIT0: this DBLK is a continuation from a previous medium."""
-		return bool(self.block_attributes & 0x00000001)
-
-	@property
-	def _string_encoding(self) -> str | None:
-		return { 0: None, 1: 'ascii', 2: 'utf-16-le' }[self._string_type]
 
 	_info_specs = [
 		('type_id', 'type', '!r'),
@@ -180,10 +210,7 @@ assert DBHeader._field_struct.size == DB_HDR_SIZE
 
 @dataclass(slots=True, kw_only=True)
 class StreamHeader(Structured):
-	"""Parsed 22-byte Stream Header (MTF_STREAM_HDR, Structure 15).
-
-	Internal use — callers interact with StreamInfo.
-	"""
+	"""Parsed 22-byte Stream Header (MTF_STREAM_HDR, Structure 15)."""
 
 	type_id: bytes
 	fs_attributes: int
@@ -214,7 +241,7 @@ class StreamHeader(Structured):
 assert StreamHeader._field_struct.size == STREAM_HDR_SIZE
 
 
-@dataclass
+@dataclass(kw_only=False)
 class DBLK(InfoExtractable):
 	type_id: ClassVar[bytes]
 
@@ -242,7 +269,7 @@ class DBLK(InfoExtractable):
 	]
 
 	@classmethod
-	def from_bytes(cls, header: DBHeader, dblk_data: bytes) -> Self: ...
+	def from_bytes(cls, dblk_data: bytes, header: DBHeader) -> Self: ...
 
 	def __init__(self):
 		if type(self) is DBLK:
@@ -287,7 +314,7 @@ class DBLK(InfoExtractable):
 		info_map.update(super()._extract_info())
 		return info_map
 
-@dataclass
+@dataclass()
 class UnknownDBLK(DBLK):
 	@property
 	def type_id(self) -> bytes:
@@ -298,7 +325,7 @@ class UnknownDBLK(DBLK):
 		return 'UNKNOWN'
 
 	@classmethod
-	def from_bytes(cls, header: DBHeader, dblk_data: bytes) -> Self:
+	def from_bytes(cls, dblk_data: bytes, header: DBHeader) -> Self:
 		return cls(header, dblk_data[DB_HDR_SIZE:], extra_offset=DB_HDR_SIZE)
 
 _dblk_type_registry: dict[bytes, type[DBLK]] = dict()
@@ -310,7 +337,7 @@ def register_dblk_type[Z: type[DBLK]](cls: Z) -> Z:
 def parse_dblk(flb_data: bytes) -> DBLK:
 	header = DBHeader.from_bytes(flb_data[:DB_HDR_SIZE])
 	dblk_type = _dblk_type_registry.get(header.type_id, UnknownDBLK)
-	return dblk_type.from_bytes(header, flb_data[:header.next_offset])
+	return dblk_type.from_bytes(flb_data[:header.next_offset], header)
 
 @register_dblk_type
 @dataclass(kw_only=True)
@@ -335,27 +362,6 @@ class TapeDBLK(DBLK, Structured):
 	software_vendor_id: int
 	_media_date: bytes
 	_mtf_major_version: int
-
-	_field_specs = [
-		('media_family_id', 'I'),
-		('tape_attributes', 'I'),
-		('media_index', 'H'),
-		('_password_encryption_algo', 'H'),
-		('_sfmb_size_512', 'H'),
-		('_mbc_type', 'H'),
-		('_media_name_size', 'H'),
-		('_media_name_offset', 'H'),
-		('_media_description_size', 'H'),
-		('_media_description_offset', 'H'),
-		('_media_password_size', 'H'),
-		('_media_password_offset', 'H'),
-		('_software_name_size', 'H'),
-		('_software_name_offset', 'H'),
-		('flb_size', 'H'),
-		('software_vendor_id', 'H'),
-		('_media_date', '5s'),
-		('_mtf_major_version', 'B'),
-	]
 
 	@property
 	def sfmb_size(self) -> int | None:
@@ -388,16 +394,28 @@ class TapeDBLK(DBLK, Structured):
 
 	@property
 	def media_datetime(self) -> datetime | None:
-		if all(b == 0x00 for b in self._media_date):
-			return None
-		v = int.from_bytes(self._media_date, 'big')
-		second, v = v % (1 << 6), v // (1 << 6)
-		minute, v = v % (1 << 6), v // (1 << 6)
-		hour,   v = v % (1 << 5), v // (1 << 5)
-		day,    v = v % (1 << 5), v // (1 << 5)
-		month,  v = v % (1 << 4), v // (1 << 4)
-		year = v
-		return datetime(year, month, day, hour, minute, second)
+		return _parse_datetime(self._media_date)
+
+	_field_specs = [
+		('media_family_id', 'I'),
+		('tape_attributes', 'I'),
+		('media_index', 'H'),
+		('_password_encryption_algo', 'H'),
+		('_sfmb_size_512', 'H'),
+		('_mbc_type', 'H'),
+		('_media_name_size', 'H'),
+		('_media_name_offset', 'H'),
+		('_media_description_size', 'H'),
+		('_media_description_offset', 'H'),
+		('_media_password_size', 'H'),
+		('_media_password_offset', 'H'),
+		('_software_name_size', 'H'),
+		('_software_name_offset', 'H'),
+		('flb_size', 'H'),
+		('software_vendor_id', 'H'),
+		('_media_date', '5s'),
+		('_mtf_major_version', 'B'),
+	]
 
 	_info_specs = [
 		('type_id', 'type', '!r'),
@@ -411,7 +429,7 @@ class TapeDBLK(DBLK, Structured):
 	]
 
 	@classmethod
-	def from_bytes(cls, header: DBHeader, dblk_data: bytes) -> Self:
+	def from_bytes(cls, dblk_data: bytes, header: DBHeader) -> Self:
 		if header.type_id != cls.type_id:
 			raise TypeError
 
@@ -430,44 +448,63 @@ assert TapeDBLK._field_struct.size == TAPE_HEADER_SIZE - DB_HDR_SIZE
 
 
 # TODO Next: Make info classes for debug use only; move them to a separate file
-@dataclass(slots=True, kw_only=True)
+@dataclass(slots=True, kw_only=False)
 class DblkInfo:
 	"""Summary information about one parsed DBLK, including its streams."""
 
-	file_offset: int | None = None
 	type_id: bytes
 
 	fields: dict[str, InfoValue] = field(default_factory=dict)
-	_field_format_specs: dict[str, InfoFormatSpec] = field(default_factory=dict, compare=False)
+	_field_format_specs: dict[str, InfoFormatSpec] = field(default_factory=dict, compare=False, kw_only=True)
 
 	streams: list['StreamInfo'] | None = field(default_factory=list)
+
+	file_offset: int | None = None
 
 	@property
 	def type_name(self) -> str:
 		"""Human-readable DBLK type name."""
-		return DBLK_TYPE_NAMES.get(self.type_id, f"UNKNOWN({self.type_id!r})")
+		return DBLK_TYPE_NAMES.get(self.type_id, f"UNKNOWN({self.type_id !r})")
 
 	@property
-	def stream_count(self) -> int | None:
+	def stream_num(self) -> int | None:
 		return len(self.streams) if self.streams is not None else None
 
 	@classmethod
-	def from_header(cls,
-		header: DBHeader, streams: Sequence['StreamHeader | StreamInfo'] | None =None,
-		file_offset: int | None =None, **kwargs: InfoValue
+	def from_fields(cls,
+		type_id: bytes, info_map: Mapping[str, tuple[InfoValue, InfoFormatSpec]] | None =None,
+		file_offset: int | None =None, **extra_fields: InfoValue
+	) -> Self:
+		info = cls(type_id, streams=None, file_offset=file_offset)
+		info.update_fields(info_map, **extra_fields)
+		return info
+
+	@classmethod
+	def from_dblk(cls,
+		dblk: DBLK, streams: Sequence['StreamHeader | StreamInfo'] | None =None,
+		file_offset: int | None =None, **extra_fields: InfoValue
 	) -> Self:
 		stream_infos = [
 				StreamInfo.from_header(item) if isinstance(item, StreamHeader) else item
 				for item in streams
 			] if streams is not None else None
 
-		return cls(
-			file_offset=file_offset,
-			type_id=header.type_id,
-			fields={ 'is_continuation': header.is_continuation, **kwargs },
-			_field_format_specs={ 'is_continuation': None },
-			streams=stream_infos
-		)
+		info = cls(dblk.type_id, streams=stream_infos, file_offset=file_offset)
+		info.update_fields(dblk._extract_info(), **extra_fields)
+		return info
+
+	def update_fields(self,
+		info_map: Mapping[str, tuple[InfoValue, InfoFormatSpec]] | None =None, /,
+		**fields: InfoValue
+	) -> None:
+		if info_map:
+			field_items, format_spec_items = zip(*(
+				((name, value), (name, format_spec)) for name, (value, format_spec) in info_map.items()))
+			self.fields.update(field_items)
+			self._field_format_specs.update(format_spec_items)
+
+		if fields:
+			self.fields.update(fields)
 
 	def __repr__(self) -> str:
 		fields, flags = [], []
@@ -476,10 +513,10 @@ class DblkInfo:
 		if self.file_offset is not None:
 			fields.append(f"offset={self.file_offset :#x}")
 
-		for key, value in self.fields.items():
-			format_spec = self._field_format_specs.get(key, '!r')
+		for name, value in self.fields.items():
+			format_spec = self._field_format_specs.get(name, '!r')
 
-			if key == 'type':
+			if name == 'type':
 				continue
 
 			if format_spec is not None:
@@ -487,10 +524,10 @@ class DblkInfo:
 					repr(value) if format_spec == '!r' else
 					repr(str(value)) if format_spec == '!s' else
 					format(value, format_spec))
-				fields.append(f"{key}={value}")
+				fields.append(f"{name}={value}")
 			else:
 				if value:
-					flags.append(key.removeprefix('is_'))
+					flags.append(name.removeprefix('is_'))
 
 		if self.streams is not None:
 			streams = [repr(stream) for stream in self.streams]
@@ -505,18 +542,19 @@ class DblkInfo:
 			+ ">"
 			+ (f"\n {stream_str}" if stream_str is not None else ''))
 
-@dataclass(slots=True, kw_only=True)
+@dataclass(slots=True, kw_only=False)
 class StreamInfo:
 	"""Metadata about a single Data Stream associated with a DBLK.
 
 	Captured during the single-pass stream skip — no extra read needed.
 	"""
 
-	file_offset: int | None = None # absolute file offset of the Stream Header
 	type_id: bytes       # 4-byte ASCII ('STAN', 'SPAD', 'NTEA', ...)
+
 	length: int            # declared byte length of stream data
-	fs_attributes: int = 0      # file-system-level flags (BIT0=modified, BIT1=security, …)
-	media_attributes: int = 0   # continuation, checksummed, encrypted, compressed
+	_content: str | None = field(default=None, kw_only=True)
+
+	file_offset: int | None = None # absolute file offset of the Stream Header
 
 	@property
 	def type_name(self) -> str:
@@ -529,20 +567,25 @@ class StreamInfo:
 	@classmethod
 	def from_header(cls,
 		header: StreamHeader,
+		dblk_assoc: DBLK | None =None, data_assoc: bytes | None =None,
 		file_offset: int | None =None, **kwargs
 	) -> Self:
 		"""Convert to a StreamInfo pinned to a file offset."""
-		return cls(
-			file_offset=file_offset,
-			type_id=header.type_id,
-			length=header.length,
-			fs_attributes=header.fs_attributes,
-			media_attributes=header.media_attributes,
-		)
+		# XXX May have a better solution? But just make it work for now.
+		content = None
+		if data_assoc is not None:
+			if header.type_id in {STREAM_PATH_NAME, STREAM_FILE_NAME} and dblk_assoc is not None:
+				try:
+					content = str(data_assoc, dblk_assoc.header._string_encoding or 'none')
+				except UnicodeDecodeError as error:
+					_log.warning(error)
+			if header.type_id == STREAM_CHECKSUM:
+				content = data_assoc.hex()
+		return cls(header.type_id, header.length, file_offset=file_offset, _content=content)
 
 	def __repr__(self) -> str:
-		# TODO: Name streams
-		return f"{self.type_name}({self.length :,})"
+		content_str = format(self.length, ',') if self._content is None else repr(self._content)
+		return f"{self.type_name}({content_str})"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -578,6 +621,7 @@ def _read_exact(f: BinaryIO, size: int) -> bytes:
 def _skip_and_collect_streams(
 	f: BinaryIO,
 	start_pos: int,
+	dblk_assoc: DBLK | None =None
 ) -> tuple[int, list[StreamInfo]]:
 	"""Skip over data streams, collecting StreamInfo on the way.
 
@@ -602,9 +646,11 @@ def _skip_and_collect_streams(
 		f.seek(pos)
 		raw_hdr = _read_exact(f, STREAM_HDR_SIZE)
 		sh = StreamHeader.from_bytes(raw_hdr)
-		_log.debug(f"Stream, offset {pos :#x}: {sh}")
+		_log.debug(f"Stream, offset {pos :#x}: {sh !r}")
 
-		streams.append(StreamInfo.from_header(sh, file_offset=pos))
+		stream_data = _read_exact(f, sh.length) if sh.length <= 256 else None
+
+		streams.append(StreamInfo.from_header(sh, dblk_assoc, stream_data, file_offset=pos))
 
 		# Stream data starts immediately after the 22-byte header.
 		data_start = pos + STREAM_HDR_SIZE
@@ -667,7 +713,7 @@ def mtf_dblk_parser(
 		try:
 			raw_data = _read_exact(f, flb_size)
 		except EOFError as error:
-			_log.warning(f"Reached end when trying to parse DBLK:")
+			_log.warning("Reached end when trying to parse DBLK:")
 			_log.warning(error)
 			break
 
@@ -685,18 +731,14 @@ def mtf_dblk_parser(
 			pos = dblk_offset + (sfmb_size if sfmb_size else dblk.header.next_offset)
 		else:
 			try:
-				pos, streams = _skip_and_collect_streams(f, dblk_offset + dblk.header.next_offset)
+				pos, streams = _skip_and_collect_streams(f, dblk_offset + dblk.header.next_offset, dblk)
 			except EOFError as error:
-				_log.warning(f"Reached end when skipping streams:")
+				_log.warning("Reached end when skipping streams:")
 				_log.warning(error)
 				break
 
 		# ── Build DblkInfo (after streams are known) ──
-		# TODO: Separate general info generation interface
-		info = DblkInfo.from_header(dblk.header, streams, file_offset=dblk_offset)
-		info_map = dblk._extract_info()
-		info.fields.update({name: value for name, (value, format_spec) in info_map.items()})
-		info._field_format_specs.update({name: format_spec for name, (value, format_spec) in info_map.items()})
+		info = DblkInfo.from_dblk(dblk, streams, file_offset=dblk_offset)
 		yield info
 
 		if dblk.type_id == MTF_EOTM:
@@ -709,8 +751,6 @@ def parse_mtf_dblk(
 	f: BinaryIO
 ) -> list[DblkInfo]:
 	return list(mtf_dblk_parser(f))
-
-# TODO: Semantic parser (build on parsed MTF DBLKs)
 
 # ═══════════════════════════════════════════════════════════════════
 # Output helpers
