@@ -115,7 +115,11 @@ class InfoExtractable(Protocol):
 		info_map = dict[str, tuple[InfoValue, InfoFormatSpec]]()
 		for attr, name, format_spec in self._info_specs:
 			guard = object()
-			value = getattr(self, attr, guard)
+			try:
+				value = getattr(self, attr, guard)
+			except Exception:
+				info_map[name] = ("<ERROR>", 's')
+				continue
 			if value is guard:
 				warnings.warn(f"No attribute {attr !r} to extract {name !r}")
 				continue
@@ -566,21 +570,26 @@ class StreamInfo:
 
 	@classmethod
 	def from_header(cls,
-		header: StreamHeader,
-		dblk_assoc: DBLK | None =None, data_assoc: bytes | None =None,
+		header: StreamHeader, data_assoc: bytes | None =None,
 		file_offset: int | None =None, **kwargs
 	) -> Self:
 		"""Convert to a StreamInfo pinned to a file offset."""
 		# XXX May have a better solution? But just make it work for now.
 		content = None
 		if data_assoc is not None:
-			if header.type_id in {STREAM_PATH_NAME, STREAM_FILE_NAME} and dblk_assoc is not None:
+
+			if header.type_id in {STREAM_PATH_NAME, STREAM_FILE_NAME}:
+				# NOTE: Undesirable to introduce DBLK dependency here; just guess the encoding
+				printables = {*range(0x20, 0x7F), *b'\t\n\r'}
+				encoding = 'ascii' if all(b in printables for b in data_assoc) else 'utf-16-le'
 				try:
-					content = str(data_assoc, dblk_assoc.header._string_encoding or 'none')
+					content = str(data_assoc, encoding)
 				except UnicodeDecodeError as error:
 					_log.warning(error)
+
 			if header.type_id == STREAM_CHECKSUM:
 				content = data_assoc.hex()
+
 		return cls(header.type_id, header.length, file_offset=file_offset, _content=content)
 
 	def __repr__(self) -> str:
@@ -620,8 +629,8 @@ def _read_exact(f: BinaryIO, size: int) -> bytes:
 
 def _skip_and_collect_streams(
 	f: BinaryIO,
-	start_pos: int,
-	dblk_assoc: DBLK | None =None
+	start_pos: int, *,
+	expect_dblk: bool =False
 ) -> tuple[int, list[StreamInfo]]:
 	"""Skip over data streams, collecting StreamInfo on the way.
 
@@ -646,11 +655,15 @@ def _skip_and_collect_streams(
 		f.seek(pos)
 		raw_hdr = _read_exact(f, STREAM_HDR_SIZE)
 		sh = StreamHeader.from_bytes(raw_hdr)
+
+		if sh.type_id in DBLK_TYPE_NAMES:
+			if not expect_dblk:
+				_log.warning(f"Unexpected DBLK at offset {pos :#x} when parsing stream")
+			return pos, streams
 		_log.debug(f"Stream, offset {pos :#x}: {sh !r}")
 
 		stream_data = _read_exact(f, sh.length) if sh.length <= 256 else None
-
-		streams.append(StreamInfo.from_header(sh, dblk_assoc, stream_data, file_offset=pos))
+		streams.append(StreamInfo.from_header(sh, stream_data, file_offset=pos))
 
 		# Stream data starts immediately after the 22-byte header.
 		data_start = pos + STREAM_HDR_SIZE
@@ -665,7 +678,8 @@ def _skip_and_collect_streams(
 		# Non-SPAD stream: skip header + declared data length,
 		# then realign to 4-byte boundary for the next stream header.
 		pos = data_start + sh.length
-		if pos % 4 != 0:
+		# NOTE: Special stream type observed which bypass alignment
+		if sh.type_id != b'CPAD' and pos % 4 != 0:
 			pos = (pos + 4 - 1) & ~(4 - 1)
 
 
@@ -675,7 +689,8 @@ def _skip_and_collect_streams(
 
 # Structural parser
 def mtf_dblk_parser(
-	f: BinaryIO
+	backup_in: BinaryIO, *,
+	header_in: BinaryIO | None =None
 ) -> Iterator[DblkInfo]:
 	"""Parse an MTF (BKF) file and return a list of DBLK info records.
 
@@ -686,10 +701,13 @@ def mtf_dblk_parser(
 		EOFError:      if the file ends unexpectedly mid-structure.
 	"""
 
+	if header_in is None:
+		header_in = backup_in
+
 	# ── Phase 1: Read MTF_TAPE at offset 0 ──
-	f.seek(0)
+	header_in.seek(0)
 	try:
-		raw_data = _read_exact(f, TAPE_HEADER_SIZE)
+		raw_data = _read_exact(header_in, TAPE_HEADER_SIZE)
 	except EOFError:
 		raise MTFParseError("Reached end before complete MTF_TAPE DBLK")
 
@@ -709,9 +727,9 @@ def mtf_dblk_parser(
 	pos = 0
 
 	for i in itertools.count(1):
-		f.seek(pos)
+		backup_in.seek(pos)
 		try:
-			raw_data = _read_exact(f, flb_size)
+			raw_data = _read_exact(backup_in, flb_size)
 		except EOFError as error:
 			_log.warning("Reached end when trying to parse DBLK:")
 			_log.warning(error)
@@ -727,11 +745,14 @@ def mtf_dblk_parser(
 		# ── Skip streams and record them ──
 		if dblk.type_id == MTF_SFMB:
 			# SFMB has no data streams (Section 5.2.10).
-			streams: list[StreamInfo] = []
+			streams = list[StreamInfo]()
 			pos = dblk_offset + (sfmb_size if sfmb_size else dblk.header.next_offset)
 		else:
 			try:
-				pos, streams = _skip_and_collect_streams(f, dblk_offset + dblk.header.next_offset, dblk)
+				pos, streams = _skip_and_collect_streams(
+					backup_in, dblk_offset + dblk.header.next_offset,
+					# NOTE: Leading DBLKs in continuation may have no streams
+					expect_dblk=dblk.header.is_continuation)
 			except EOFError as error:
 				_log.warning("Reached end when skipping streams:")
 				_log.warning(error)
@@ -748,9 +769,10 @@ def mtf_dblk_parser(
 	_log.info(f"Parsed DBLKs: {i}")
 
 def parse_mtf_dblk(
-	f: BinaryIO
+	backup_in: BinaryIO, *,
+	header_in: BinaryIO | None =None
 ) -> list[DblkInfo]:
-	return list(mtf_dblk_parser(f))
+	return list(mtf_dblk_parser(header_in=header_in, backup_in=backup_in))
 
 # ═══════════════════════════════════════════════════════════════════
 # Output helpers
