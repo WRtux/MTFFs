@@ -2,16 +2,19 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Self
 
-from .._utils import parse_datetime
 from .._utils import Structured
-from ..constants import MTF_TAPE, DB_HDR_SIZE, TAPE_HEADER_SIZE
+from .._utils import parse_datetime
+from .constants import (
+	KnownDBLK,
+	DB_HDR_SIZE, TAPE_HEADER_SIZE,
+)
 from .common import DBHeader, DBLK, register_dblk_type
 
 
 @register_dblk_type
 @dataclass(kw_only=True)
 class TapeDBLK(DBLK, Structured):
-	type_id = MTF_TAPE
+	type_id = KnownDBLK.MTF_TAPE.value
 
 	media_family_id: int
 	tape_attributes: int
@@ -65,7 +68,7 @@ class TapeDBLK(DBLK, Structured):
 	def media_datetime(self) -> datetime | None:
 		return parse_datetime(self._media_date)
 
-	_field_specs = [
+	_field_specs = (
 		('media_family_id', 'I'),
 		('tape_attributes', 'I'),
 		('media_index', 'H'),
@@ -84,18 +87,19 @@ class TapeDBLK(DBLK, Structured):
 		('software_vendor_id', 'H'),
 		('_media_date', '5s'),
 		('_mtf_major_version', 'B'),
-	]
+	)
 
-	_info_specs = [
-		('type_id', 'type', '!r'),
+	_info_specs = (
 		('media_family_id', 'media_family', '#010x'),
 		('media_index', 'media_index', 'd'),
 		('media_name', 'name', '!s'),
 		('media_description', 'desc', '!s'),
+		('media_datetime', 'time', '!s'),
 		('software_name', 'software', '!s'),
+		('software_vendor_id', 'vendor_id', '#06x'),
 		('flb_size', 'FLB_size', 'd'),
 		('sfmb_size', 'SFMB_size', 'd'),
-	]
+	)
 
 	@classmethod
 	def from_bytes(cls, dblk_data: bytes, header: DBHeader) -> Self:

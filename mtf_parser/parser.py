@@ -17,28 +17,10 @@ from collections.abc import Buffer, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import BinaryIO, Self, TextIO
 
-from .constants import (
-	DB_HDR_SIZE,
-	STREAM_HDR_SIZE,
-	TAPE_HEADER_SIZE,
-	MTF_TAPE,
-	MTF_SSET,
-	MTF_VOLB,
-	MTF_DIRB,
-	MTF_FILE,
-	MTF_CFIL,
-	MTF_ESPB,
-	MTF_ESET,
-	MTF_EOTM,
-	MTF_SFMB,
-	DBLK_TYPE_NAMES,
-	STREAM_STANDARD,
-	STREAM_PATH_NAME,
-	STREAM_FILE_NAME,
-	STREAM_CHECKSUM,
-	STREAM_CORRUPT,
-	STREAM_PAD,
-	VALID_FLB_SIZES,
+from .mtf.constants import (
+	KnownDBLK, KnownStream,
+	STREAM_HDR_SIZE, TAPE_HEADER_SIZE,
+	DBLK_TYPE_NAME_MAP, VALID_FLB_SIZES,
 )
 from .mtf.common import StreamHeader, DBLK, parse_dblk
 from .mtf.dblk_types import TapeDBLK
@@ -72,7 +54,7 @@ class DblkInfo:
 	@property
 	def type_name(self) -> str:
 		"""Human-readable DBLK type name."""
-		return DBLK_TYPE_NAMES.get(self.type_id, f"UNKNOWN({self.type_id !r})")
+		return DBLK_TYPE_NAME_MAP.get(self.type_id, f"UNKNOWN({self.type_id !r})")
 
 	@property
 	def stream_num(self) -> int | None:
@@ -182,7 +164,7 @@ class StreamInfo:
 		content = None
 		if data_assoc is not None:
 
-			if header.type_id in {STREAM_PATH_NAME, STREAM_FILE_NAME}:
+			if header.type_id in {KnownStream.STREAM_PATH_NAME, KnownStream.STREAM_FILE_NAME}:
 				# NOTE: Undesirable to introduce DBLK dependency here; just guess the encoding
 				printables = {*range(0x20, 0x7F), *b'\t\n\r'}
 				encoding = 'ascii' if all(b in printables for b in data_assoc) else 'utf-16-le'
@@ -191,7 +173,7 @@ class StreamInfo:
 				except UnicodeDecodeError as error:
 					_log.warning(error)
 
-			if header.type_id == STREAM_CHECKSUM:
+			if header.type_id == KnownStream.STREAM_CHECKSUM:
 				content = data_assoc.hex()
 
 		return cls(header.type_id, header.length, file_offset=file_offset, _content=content)
@@ -260,7 +242,7 @@ def _skip_and_collect_streams(
 		raw_hdr = _read_exact(f, STREAM_HDR_SIZE)
 		sh = StreamHeader.from_bytes(raw_hdr)
 
-		if sh.type_id in DBLK_TYPE_NAMES:
+		if sh.type_id in KnownDBLK:
 			if not expect_dblk:
 				_log.warning(f"Unexpected DBLK at offset {pos :#x} when parsing stream")
 			return pos, streams
@@ -272,11 +254,11 @@ def _skip_and_collect_streams(
 		# Stream data starts immediately after the 22-byte header.
 		data_start = pos + STREAM_HDR_SIZE
 
-		if sh.type_id == STREAM_PAD:
+		if sh.type_id == KnownStream.STREAM_PAD:
 			# SPAD data fills exactly to the next FLB boundary.
 			return data_start + sh.length, streams
 
-		if sh.type_id == STREAM_CORRUPT:
+		if sh.type_id == KnownStream.STREAM_CORRUPT:
 			raise MTFParseError(f"Corrupt stream marker at offset {pos :#x}")
 
 		# Non-SPAD stream: skip header + declared data length,
@@ -316,8 +298,8 @@ def mtf_dblk_parser(
 		raise MTFParseError("Reached end before complete MTF_TAPE DBLK")
 
 	tape_dblk = parse_dblk(raw_data)
-	if tape_dblk.type_id != MTF_TAPE:
-		raise MTFParseError(f"Expected MTF_TAPE at head, got {tape_dblk.type_name}")
+	if tape_dblk.type_id != KnownDBLK.MTF_TAPE:
+		raise MTFParseError(f"Expected MTF_TAPE at head, got {tape_dblk.type_id !r}")
 	assert isinstance(tape_dblk, TapeDBLK)
 	_log.debug(f"Tape header: {tape_dblk !r}")
 
@@ -343,11 +325,11 @@ def mtf_dblk_parser(
 		dblk = parse_dblk(raw_data)
 		_log.debug(f"DBLK {i}, offset {dblk_offset :#x}: {dblk !r}")
 
-		if dblk.type_id == MTF_CFIL:
+		if dblk.type_id == KnownDBLK.MTF_CFIL:
 			raise MTFParseError(f"Corrupt object DBLK at offset {dblk_offset :#x}")
 
 		# ── Skip streams and record them ──
-		if dblk.type_id == MTF_SFMB:
+		if dblk.type_id == KnownDBLK.MTF_SFMB:
 			# SFMB has no data streams (Section 5.2.10).
 			streams = list[StreamInfo]()
 			pos = dblk_offset + (sfmb_size if sfmb_size else dblk.header.next_offset)
@@ -366,7 +348,7 @@ def mtf_dblk_parser(
 		info = DblkInfo.from_dblk(dblk, streams, file_offset=dblk_offset)
 		yield info
 
-		if dblk.type_id == MTF_EOTM:
+		if dblk.type_id == KnownDBLK.MTF_EOTM:
 			_log.info("EOTM reached")
 			break
 
@@ -383,17 +365,18 @@ def parse_mtf_dblk(
 # ═══════════════════════════════════════════════════════════════════
 
 _dblk_level_map = {
-	MTF_TAPE: 0,
-	MTF_SSET: 1,
-	MTF_VOLB: 2,
-	MTF_DIRB: 3,
-	MTF_FILE: 4,
-	MTF_CFIL: -1,
-	MTF_ESPB: 2,
-	MTF_ESET: 1,
-	MTF_EOTM: 0,
-	MTF_SFMB: 0,
-}
+	known_dblk.value: level for known_dblk, level in {
+		KnownDBLK.MTF_TAPE: 0,
+		KnownDBLK.MTF_SSET: 1,
+		KnownDBLK.MTF_VOLB: 2,
+		KnownDBLK.MTF_DIRB: 3,
+		KnownDBLK.MTF_FILE: 4,
+		KnownDBLK.MTF_CFIL: -1,
+		KnownDBLK.MTF_ESPB: 2,
+		KnownDBLK.MTF_ESET: 1,
+		KnownDBLK.MTF_EOTM: 0,
+		KnownDBLK.MTF_SFMB: 0,
+	}.items()}
 
 def inspect_mtf_dblk_streaming(src: Iterable[DblkInfo], stream: TextIO | None =None) -> Iterator[DblkInfo]:
 	prev_level = 0

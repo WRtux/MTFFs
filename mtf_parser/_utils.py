@@ -1,50 +1,15 @@
 import warnings
-from collections.abc import Buffer, Sequence
-from datetime import datetime
+from collections.abc import Buffer
+from datetime import datetime, timedelta, timezone
 from struct import Struct
 from typing import Any, ClassVar, Protocol, Self
 
 
-# Helpers
-
-type RangeSlice = slice[int | None, int | None, None]
-
-def slice_offset[T: slice[int | None]](src: T, offset: int | None) -> T:
-	if offset is None:
-		return src
-
-	start, stop = src.start, src.stop
-	if start is not None and start >= 0:
-		start += offset
-		if start < 0:
-			raise IndexError(f"Slice start index out of range: {start}")
-	if stop is not None and stop >= 0:
-		stop += offset
-		if stop < 0:
-			raise IndexError(f"Slice stop index out of range: {stop}")
-	return slice(start, stop, src.step) # type: ignore
-
-def parse_datetime(data: Buffer) -> datetime | None:
-	data = bytes(data)
-	assert len(data) == 5
-
-	v = int.from_bytes(data, 'big')
-	if v == 0:
-		return None
-	second, v = v % (1 << 6), v // (1 << 6)
-	minute, v = v % (1 << 6), v // (1 << 6)
-	hour,   v = v % (1 << 5), v // (1 << 5)
-	day,    v = v % (1 << 5), v // (1 << 5)
-	month,  v = v % (1 << 4), v // (1 << 4)
-	year = v
-	return datetime(year, month, day, hour, minute, second)
-
-
 # Protocols
 
-type StructFieldSpec = Sequence[tuple[str | None, str]]
+type StructFieldSpec = tuple[tuple[str | None, str], ...]
 
-type InfoFieldSpec = Sequence[tuple[str, str, str | None]]
+type InfoFieldSpec = tuple[tuple[str, str, str | None], ...]
 type InfoValue = bool | int | object
 type InfoFormatSpec = str | None
 
@@ -94,3 +59,43 @@ class InfoExtractable(Protocol):
 
 	def _extract_info_values(self) -> dict[str, InfoValue]:
 		return {name: value for name, (value, _) in self._extract_info().items()}
+
+
+# Helpers
+
+type RangeSlice = slice[int | None, int | None, None]
+
+def slice_offset[T: slice[int | None]](src: T, offset: int | None) -> T:
+	if offset is None:
+		return src
+
+	start, stop = src.start, src.stop
+	if start is not None and start >= 0:
+		start += offset
+		if start < 0:
+			raise IndexError(f"Slice start index out of range: {start}")
+	if stop is not None and stop >= 0:
+		stop += offset
+		if stop < 0:
+			raise IndexError(f"Slice stop index out of range: {stop}")
+	return slice(start, stop, src.step) # type: ignore
+
+def parse_datetime(data: Buffer) -> datetime | None:
+	data = bytes(data)
+	assert len(data) == 5
+
+	v = int.from_bytes(data, 'big')
+	if v == 0:
+		return None
+	second, v = v % (1 << 6), v // (1 << 6)
+	minute, v = v % (1 << 6), v // (1 << 6)
+	hour,   v = v % (1 << 5), v // (1 << 5)
+	day,    v = v % (1 << 5), v // (1 << 5)
+	month,  v = v % (1 << 4), v // (1 << 4)
+	year = v
+	return datetime(year, month, day, hour, minute, second)
+
+def get_timezone(value: int) -> timezone | None:
+	if value == 127:
+		return None
+	return timezone(timedelta(minutes=(value * 15)))

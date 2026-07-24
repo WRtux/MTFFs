@@ -3,59 +3,64 @@
 All multi-byte values in MTF are stored in Intel little-endian byte order.
 """
 
+from enum import Enum
+
 # ── DBLK Type IDs ─────────────────────────────────────────────────
 # Four-character ASCII tags stored as 4-byte little-endian values.
 # E.g. 'TAPE' → bytes T,A,P,E → 0x45504154 on little-endian.
 
-MTF_TAPE = b"TAPE"  # Tape / Media Header
-MTF_SSET = b"SSET"  # Start of Data Set
-MTF_VOLB = b"VOLB"  # Volume
-MTF_DIRB = b"DIRB"  # Directory
-MTF_FILE = b"FILE"  # File
-MTF_CFIL = b"CFIL"  # Corrupt Object
-MTF_ESPB = b"ESPB"  # End-of-Set Pad
-MTF_ESET = b"ESET"  # End of Data Set
-MTF_EOTM = b"EOTM"  # End of Tape Marker
-MTF_SFMB = b"SFMB"  # Soft Filemark
+class KnownDBLK(Enum):
+	MTF_TAPE = b"TAPE"  # Tape / Media Header
+	MTF_SSET = b"SSET"  # Start of Data Set
+	MTF_VOLB = b"VOLB"  # Volume
+	MTF_DIRB = b"DIRB"  # Directory
+	MTF_FILE = b"FILE"  # File
+	MTF_CFIL = b"CFIL"  # Corrupt Object
+	MTF_ESPB = b"ESPB"  # End-of-Set Pad
+	MTF_ESET = b"ESET"  # End of Data Set
+	MTF_EOTM = b"EOTM"  # End of Tape Marker
+	MTF_SFMB = b"SFMB"  # Soft Filemark
 
-DBLK_TYPE_NAMES: dict[bytes, str] = {
-	MTF_TAPE: "MTF_TAPE",
-	MTF_SSET: "MTF_SSET",
-	MTF_VOLB: "MTF_VOLB",
-	MTF_DIRB: "MTF_DIRB",
-	MTF_FILE: "MTF_FILE",
-	MTF_CFIL: "MTF_CFIL",
-	MTF_ESPB: "MTF_ESPB",
-	MTF_ESET: "MTF_ESET",
-	MTF_EOTM: "MTF_EOTM",
-	MTF_SFMB: "MTF_SFMB",
-}
+	def __eq__(self, value: object) -> bool:
+		return self.value == value or super().__eq__(value)
+
+	def __hash__(self) -> int:
+		return hash(self.value)
+
+DBLK_TYPE_NAME_MAP = {known_dblk.value: known_dblk.name for known_dblk in KnownDBLK}
 
 # ── Stream Type IDs ───────────────────────────────────────────────
 
-STREAM_STANDARD = b"STAN"       # Standard file data
-STREAM_PATH_NAME = b"PNAM"      # Directory name (oversized, can't fit in DIRB)
-STREAM_FILE_NAME = b"FNAM"      # File name (oversized, can't fit in FILE)
-STREAM_CHECKSUM = b"CSUM"       # Checksum of previous stream
-STREAM_CORRUPT = b"CRPT"        # Previous stream was corrupt
-STREAM_PAD = b"SPAD"            # Padding to next FLB boundary
-STREAM_SPARSE = b"SPAR"         # Sparse file data
+class KnownStream(Enum):
+	STREAM_STANDARD = b"STAN"       # Standard file data
+	STREAM_PATH_NAME = b"PNAM"      # Directory name (oversized, can't fit in DIRB)
+	STREAM_FILE_NAME = b"FNAM"      # File name (oversized, can't fit in FILE)
+	STREAM_CHECKSUM = b"CSUM"       # Checksum of previous stream
+	STREAM_CORRUPT = b"CRPT"        # Previous stream was corrupt
+	STREAM_PAD = b"SPAD"            # Padding to next FLB boundary
+	STREAM_SPARSE = b"SPAR"         # Sparse file data
 
-# Platform-specific
-STREAM_NT_ALT = b"NTAC"         # NTFS Alternate Data Stream
-STREAM_NT_EA = b"NTEA"          # NTFS Extended Attributes
-STREAM_NT_SECURITY = b"NTSS"    # NTFS Security Descriptor
-STREAM_NT_ENCRYPTED = b"NTEF"   # Encrypted File Data
-STREAM_NT_QUOTA = b"NTQU"       # Disk Quota
-STREAM_NT_PROPERTY = b"NTPR"    # Property Data
-STREAM_NT_REPARSE = b"NTRP"     # Reparse Point Data
-STREAM_NT_OBJECT_ID = b"NTOI"   # Object ID Data
+	# Platform-specific
+	STREAM_NT_ALT = b"NTAC"         # NTFS Alternate Data Stream
+	STREAM_NT_EA = b"NTEA"          # NTFS Extended Attributes
+	STREAM_NT_SECURITY = b"NTSS"    # NTFS Security Descriptor
+	STREAM_NT_ENCRYPTED = b"NTEF"   # Encrypted File Data
+	STREAM_NT_QUOTA = b"NTQU"       # Disk Quota
+	STREAM_NT_PROPERTY = b"NTPR"    # Property Data
+	STREAM_NT_REPARSE = b"NTRP"     # Reparse Point Data
+	STREAM_NT_OBJECT_ID = b"NTOI"   # Object ID Data
 
-# MBC streams
-STREAM_MBC_SET_MAP_TYPE1 = b"TSMP"
-STREAM_MBC_FDD_TYPE1 = b"TFDD"
-STREAM_MBC_SET_MAP_TYPE2 = b"MAP2"
-STREAM_MBC_FDD_TYPE2 = b"FDD2"
+	# MBC streams
+	STREAM_MBC_SET_MAP_TYPE1 = b"TSMP"
+	STREAM_MBC_FDD_TYPE1 = b"TFDD"
+	STREAM_MBC_SET_MAP_TYPE2 = b"MAP2"
+	STREAM_MBC_FDD_TYPE2 = b"FDD2"
+
+	def __eq__(self, value: object) -> bool:
+		return self.value == value or super().__eq__(value)
+
+	def __hash__(self) -> int:
+		return hash(self.value)
 
 # ── Structure sizes ───────────────────────────────────────────────
 
@@ -66,9 +71,7 @@ TAPE_HEADER_SIZE = DB_HDR_SIZE + 42
 
 # ── Format Logical Block sizes ────────────────────────────────────
 
-FLB_512 = 512
-FLB_1024 = 1024
-VALID_FLB_SIZES: set[int] = {FLB_512, FLB_1024}
+VALID_FLB_SIZES: set[int] = {512, 1024}
 
 # ── Block Attribute bits (in MTF_DB_HDR.BlockAttributes) ─────────
 # BIT0  — MTF_CONTINUATION: this DBLK is a continuation from previous tape
@@ -86,6 +89,7 @@ VALID_FLB_SIZES: set[int] = {FLB_512, FLB_1024}
 
 # ── String Types ──────────────────────────────────────────────────
 
-NO_STRINGS = 0
-ANSI_STR = 1
-UNICODE_STR = 2
+class StringType(Enum):
+	NO_STRINGS = 0
+	ANSI = 1
+	UNICODE = 2

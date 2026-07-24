@@ -1,9 +1,9 @@
 from dataclasses import dataclass, field
 from typing import ClassVar, Self, overload
 
-from .._utils import RangeSlice, slice_offset
 from .._utils import InfoExtractable, Structured
-from ..constants import DB_HDR_SIZE, STREAM_HDR_SIZE, DBLK_TYPE_NAMES
+from .._utils import RangeSlice, slice_offset
+from .constants import DB_HDR_SIZE, STREAM_HDR_SIZE, DBLK_TYPE_NAME_MAP
 
 
 @dataclass(slots=True, kw_only=True)
@@ -20,7 +20,7 @@ class DBHeader(InfoExtractable, Structured):
 	_os_id: int                  # offset 10: uint8  — OS identifier (see Appendix A)
 	_os_version: int             # offset 11: uint8  — OS-specific structure version
 	display_size: int           # offset 12: uint64 — user-visible size (e.g. file size)
-	format_logical_address: int # offset 20: uint64 — FLA within Data Set
+	logical_address: int # offset 20: uint64 — FLA within Data Set
 	_reserved_mbc: int           # offset 28: uint16 — MBC application-specific storage
 	control_block_id: int       # offset 36: uint32 — sequential ID for error recovery
 	_os_specific_size: int       # offset 44: uint16 — size of OS-specific data area
@@ -29,8 +29,8 @@ class DBHeader(InfoExtractable, Structured):
 	_checksum: bytes = field(repr=False)
 
 	@property
-	def type_name(self) -> str:
-		return DBLK_TYPE_NAMES.get(self.type_id, 'UNKNOWN')
+	def type_name(self) -> str | None:
+		return DBLK_TYPE_NAME_MAP.get(self.type_id, None)
 
 	@property
 	def is_continuation(self) -> bool:
@@ -41,14 +41,14 @@ class DBHeader(InfoExtractable, Structured):
 	def _string_encoding(self) -> str | None:
 		return { 0: None, 1: 'ascii', 2: 'utf-16-le' }[self._string_type]
 
-	_field_specs = [
+	_field_specs = (
 		('type_id', '4s'),
 		('block_attributes', 'I'),
 		('next_offset', 'H'),
 		('_os_id', 'B'),
 		('_os_version', 'B'),
 		('display_size', 'Q'),
-		('format_logical_address', 'Q'),
+		('logical_address', 'Q'),
 		('_reserved_mbc', 'H'),
 		(None, '6s'),
 		('control_block_id', 'I'),
@@ -58,15 +58,15 @@ class DBHeader(InfoExtractable, Structured):
 		('_string_type', 'B'),
 		(None, '1s'),
 		('_checksum', '2s'),
-	]
+	)
 
-	_info_specs = [
+	_info_specs = (
 		('type_id', 'type', '!r'),
 		('control_block_id', 'CB', 'd'),
-		('format_logical_address', 'FLA', 'd'),
+		('logical_address', 'FLA', 'd'),
 		('is_continuation', 'is_continuation', None),
 		# TODO: Other block attributes
-	]
+	)
 
 	@classmethod
 	def from_bytes(cls, data: bytes) -> Self:
@@ -91,7 +91,7 @@ class StreamHeader(Structured):
 	_compression_algo: int
 	_checksum: bytes = field(repr=False)
 
-	_field_specs = [
+	_field_specs = (
 		('type_id', '4s'),
 		('fs_attributes', 'H'),
 		('media_attributes', 'H'),
@@ -99,7 +99,7 @@ class StreamHeader(Structured):
 		('_encryption_algo', 'H'),
 		('_compression_algo', 'H'),
 		('_checksum', '2s'),
-	]
+	)
 
 	@classmethod
 	def from_bytes(cls, data: bytes) -> Self:
@@ -122,7 +122,7 @@ class DBLK(InfoExtractable):
 
 	@property
 	def type_name(self) -> str:
-		return DBLK_TYPE_NAMES[self.type_id]
+		return DBLK_TYPE_NAME_MAP[self.type_id]
 
 	@property
 	def _display_size(self) -> int | None:
@@ -133,11 +133,10 @@ class DBLK(InfoExtractable):
 	def _os_specific_data(self) -> memoryview | None:
 		return self._var_field(self.header._os_specific_offset, self.header._os_specific_size)
 
-	_info_specs = [
-		('type_id', 'type', '!r'),
+	_info_specs = (
 		('_display_size', 'display_size?', ',d'), # Guard if not none
 		# NOTE Displayable size also observed in: SSET SFMB
-	]
+	)
 
 	@classmethod
 	def from_bytes(cls, dblk_data: bytes, header: DBHeader) -> Self: ...
