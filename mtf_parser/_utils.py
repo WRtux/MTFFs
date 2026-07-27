@@ -80,6 +80,17 @@ def slice_offset[T: slice[int | None]](src: T, offset: int | None) -> T:
 			raise IndexError(f"Slice stop index out of range: {stop}")
 	return slice(start, stop, src.step) # type: ignore
 
+def xor_checksum(data: bytes) -> int:
+	"""Compute 16-bit word-wise XOR checksum over `data`.
+
+	As defined in MTF spec Structure 4 (DBHeader) and Structure 15
+	(StreamHeader):  each 2-byte little-endian word is XOR'd together.
+	"""
+	checksum = 0
+	for i in range(0, len(data), 2):
+		checksum ^= int.from_bytes(data[i : i + 2], 'little')
+	return checksum
+
 def parse_datetime(data: Buffer) -> datetime | None:
 	data = bytes(data)
 	assert len(data) == 5

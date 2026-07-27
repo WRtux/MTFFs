@@ -216,7 +216,8 @@ def _read_exact(f: BinaryIO, size: int) -> bytes:
 def _skip_and_collect_streams(
 	f: BinaryIO,
 	start_pos: int, *,
-	expect_dblk: bool =False
+	expect_dblk: bool =False,
+	strict: bool =False,
 ) -> tuple[int, list[StreamInfo]]:
 	"""Skip over data streams, collecting StreamInfo on the way.
 
@@ -228,7 +229,8 @@ def _skip_and_collect_streams(
 		(including the terminal SPAD).
 
 	Raises:
-		MTFParseError: if a CRPT (corrupt) stream is encountered.
+		ValueError: if *strict* is True and a Stream Header
+			checksum fails.
 	"""
 	streams: list[StreamInfo] = []
 	pos = start_pos
@@ -240,13 +242,14 @@ def _skip_and_collect_streams(
 	while True:
 		f.seek(pos)
 		raw_hdr = _read_exact(f, STREAM_HDR_SIZE)
-		sh = StreamHeader.from_bytes(raw_hdr)
+		sh = StreamHeader.from_bytes(raw_hdr, strict_checksum=strict)
 
 		if sh.type_id in KnownDBLK:
 			if not expect_dblk:
 				_log.warning(f"Unexpected DBLK at offset {pos :#x} when parsing stream")
 			return pos, streams
-		_log.debug(f"Stream, offset {pos :#x}: {sh !r}")
+		if _log.isEnabledFor(logging.DEBUG):
+			_log.debug(f"Stream, offset {pos :#x}: {sh !r}")
 
 		stream_data = _read_exact(f, sh.length) if sh.length <= 256 else None
 		streams.append(StreamInfo.from_header(sh, stream_data, file_offset=pos))
@@ -259,7 +262,7 @@ def _skip_and_collect_streams(
 			return data_start + sh.length, streams
 
 		if sh.type_id == KnownStream.STREAM_CORRUPT:
-			raise MTFParseError(f"Corrupt stream marker at offset {pos :#x}")
+			_log.error(f"Corrupt stream marker at offset {pos :#x}")
 
 		# Non-SPAD stream: skip header + declared data length,
 		# then realign to 4-byte boundary for the next stream header.
@@ -276,7 +279,8 @@ def _skip_and_collect_streams(
 # Structural parser
 def mtf_dblk_parser(
 	backup_in: BinaryIO, *,
-	header_in: BinaryIO | None =None
+	header_in: BinaryIO | None =None,
+	strict: bool =False,
 ) -> Iterator[DblkInfo]:
 	"""Parse an MTF (BKF) file and return a list of DBLK info records.
 
@@ -285,8 +289,8 @@ def mtf_dblk_parser(
 	Raises:
 		MTFParseError: on structural violations.
 		EOFError:      if the file ends unexpectedly mid-structure.
+		ValueError:    if *strict* is True and a checksum fails.
 	"""
-
 	if header_in is None:
 		header_in = backup_in
 
@@ -297,16 +301,17 @@ def mtf_dblk_parser(
 	except EOFError:
 		raise MTFParseError("Reached end before complete MTF_TAPE DBLK")
 
-	tape_dblk = parse_dblk(raw_data)
+	tape_dblk = parse_dblk(raw_data, strict=strict)
 	if tape_dblk.type_id != KnownDBLK.MTF_TAPE:
 		raise MTFParseError(f"Expected MTF_TAPE at head, got {tape_dblk.type_id !r}")
 	assert isinstance(tape_dblk, TapeDBLK)
-	_log.debug(f"Tape header: {tape_dblk !r}")
+	if _log.isEnabledFor(logging.DEBUG):
+		_log.debug(f"Tape header: {tape_dblk !r}")
 
 	# Get key fields from MTF_TAPE DBLK.
 	flb_size = tape_dblk.flb_size           # Format Logical Block Size
 	if flb_size not in VALID_FLB_SIZES:
-		_log.error(f"Unsupported FLB size {flb_size} (expected 512 or 1024)")
+		_log.error(f"Unsupported FLB size {flb_size} (expected {VALID_FLB_SIZES !r})")
 	sfmb_size = tape_dblk.sfmb_size         # Soft Filemark Block Size
 
 	# ── Phase 2: Traverse through DBLKs ──
@@ -322,11 +327,12 @@ def mtf_dblk_parser(
 			break
 
 		dblk_offset = pos
-		dblk = parse_dblk(raw_data)
-		_log.debug(f"DBLK {i}, offset {dblk_offset :#x}: {dblk !r}")
+		dblk = parse_dblk(raw_data, strict=strict)
+		if _log.isEnabledFor(logging.DEBUG):
+			_log.debug(f"DBLK {i}, offset {dblk_offset :#x}: {dblk !r}")
 
 		if dblk.type_id == KnownDBLK.MTF_CFIL:
-			raise MTFParseError(f"Corrupt object DBLK at offset {dblk_offset :#x}")
+			_log.error(f"Corrupt object DBLK at offset {dblk_offset :#x}")
 
 		# ── Skip streams and record them ──
 		if dblk.type_id == KnownDBLK.MTF_SFMB:
@@ -338,7 +344,8 @@ def mtf_dblk_parser(
 				pos, streams = _skip_and_collect_streams(
 					backup_in, dblk_offset + dblk.header.next_offset,
 					# NOTE: Leading DBLKs in continuation may have no streams
-					expect_dblk=dblk.header.is_continuation)
+					expect_dblk=dblk.header.is_continuation,
+					strict=strict)
 			except EOFError as error:
 				_log.warning("Reached end when skipping streams:")
 				_log.warning(error)
@@ -356,9 +363,10 @@ def mtf_dblk_parser(
 
 def parse_mtf_dblk(
 	backup_in: BinaryIO, *,
-	header_in: BinaryIO | None =None
+	header_in: BinaryIO | None =None,
+	strict: bool =False,
 ) -> list[DblkInfo]:
-	return list(mtf_dblk_parser(header_in=header_in, backup_in=backup_in))
+	return list(mtf_dblk_parser(header_in=header_in, backup_in=backup_in, strict=strict))
 
 # ═══════════════════════════════════════════════════════════════════
 # Output helpers

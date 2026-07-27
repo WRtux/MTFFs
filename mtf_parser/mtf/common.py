@@ -1,9 +1,33 @@
+import dataclasses
+import logging
 from dataclasses import dataclass, field
 from typing import ClassVar, Self, overload
 
 from .._utils import InfoExtractable, Structured
-from .._utils import RangeSlice, slice_offset
+from .._utils import RangeSlice, slice_offset, xor_checksum
 from .constants import DB_HDR_SIZE, STREAM_HDR_SIZE, DBLK_TYPE_NAME_MAP
+
+_log = logging.getLogger(__name__)
+
+
+def _verify_checksum(
+	data: bytes, expected: int | bytes,
+	msg: str | None =None, *,
+	strict_checksum: bool =False,
+) -> bool:
+	"""Verify word-wise XOR checksum.  Warn or raise on mismatch."""
+	checksum = expected if isinstance(expected, int) else int.from_bytes(expected, 'little')
+	actual = xor_checksum(data)
+
+	if actual != checksum:
+		msg = msg or "Checksum mismatch"
+		msg = f"{msg}: Expected {checksum :#06x}, computed {actual :#06x}"
+
+		if strict_checksum:
+			raise ValueError(msg)
+		_log.warning(msg)
+		return False
+	return True
 
 
 @dataclass(slots=True, kw_only=True)
@@ -31,6 +55,18 @@ class DBHeader(InfoExtractable, Structured):
 	@property
 	def type_name(self) -> str | None:
 		return DBLK_TYPE_NAME_MAP.get(self.type_id, None)
+
+	@property
+	def is_checksum_correct(self) -> bool:
+		import struct
+		field_map = dataclasses.asdict(self)
+		data = self._field_struct.pack(*(
+				field_map[key] if key is not None else bytes(struct.calcsize(format_def))
+			for key, format_def in self._field_specs)) # TODO: Add a public, rigorous interface
+		return xor_checksum(data) == 0
+	@property
+	def _is_metadata_corrupt(self) -> bool:
+		return not self.is_checksum_correct
 
 	@property
 	def is_continuation(self) -> bool:
@@ -64,17 +100,28 @@ class DBHeader(InfoExtractable, Structured):
 		('type_id', 'type', '!r'),
 		('control_block_id', 'CB', 'd'),
 		('logical_address', 'FLA', 'd'),
+		('_is_metadata_corrupt', 'is_corrupt', None),
 		('is_continuation', 'is_continuation', None),
 		# TODO: Other block attributes
 	)
 
 	@classmethod
-	def from_bytes(cls, data: bytes) -> Self:
-		"""Unpack a 52-byte Common Block Header."""
+	def from_bytes(cls, data: bytes, *, strict_checksum: bool = False) -> Self:
+		"""Unpack a 52-byte Common Block Header.
+
+		If *strict_checksum* is True raises ``ValueError`` on mismatch;
+		otherwise logs a warning.
+		"""
 		if (size := len(data)) != (struct_size := cls._field_struct.size):
 			raise ValueError(f"Expected {struct_size} bytes for DB_HDR, got {size}")
 
 		field_map = cls._unpack_field_map(data)
+		# Checksum covers all bytes except the last 2
+		_verify_checksum(
+			data[:struct_size - 2], field_map['_checksum'],
+			"DBHeader checksum mismatch",
+			strict_checksum=strict_checksum)
+
 		return cls(**field_map)
 
 assert DBHeader._field_struct.size == DB_HDR_SIZE
@@ -91,6 +138,18 @@ class StreamHeader(Structured):
 	_compression_algo: int
 	_checksum: bytes = field(repr=False)
 
+	@property
+	def is_checksum_correct(self) -> bool:
+		import struct
+		field_map = dataclasses.asdict(self)
+		data = self._field_struct.pack(*(
+				field_map[key] if key is not None else bytes(struct.calcsize(format_def))
+			for key, format_def in self._field_specs)) # TODO: Add a public, rigorous interface
+		return xor_checksum(data) == 0
+	@property
+	def _is_metadata_corrupt(self) -> bool:
+		return not self.is_checksum_correct
+
 	_field_specs = (
 		('type_id', '4s'),
 		('fs_attributes', 'H'),
@@ -102,11 +161,22 @@ class StreamHeader(Structured):
 	)
 
 	@classmethod
-	def from_bytes(cls, data: bytes) -> Self:
+	def from_bytes(cls, data: bytes, *, strict_checksum: bool = False) -> Self:
+		"""Unpack a 22-byte Stream Header.
+
+		If *strict_checksum* is True raises ``ValueError`` on mismatch;
+		otherwise logs a warning.
+		"""
 		if (size := len(data)) != (struct_size := cls._field_struct.size):
 			raise ValueError(f"Expected {struct_size} bytes for Stream Header, got {size}")
 
 		field_map = cls._unpack_field_map(data)
+		# Checksum covers all bytes except the last 2
+		_verify_checksum(
+			data[:struct_size - 2], field_map['_checksum'],
+			"StreamHeader checksum mismatch",
+			strict_checksum=strict_checksum)
+
 		return cls(**field_map)
 
 assert StreamHeader._field_struct.size == STREAM_HDR_SIZE
@@ -205,7 +275,12 @@ def register_dblk_type[Z: type[DBLK]](cls: Z) -> Z:
 	_dblk_type_registry[cls.type_id] = cls
 	return cls
 
-def parse_dblk(flb_data: bytes) -> DBLK:
-	header = DBHeader.from_bytes(flb_data[:DB_HDR_SIZE])
+def parse_dblk(flb_data: bytes, *, strict: bool = False) -> DBLK:
+	header = DBHeader.from_bytes(flb_data[:DB_HDR_SIZE], strict_checksum=strict)
 	dblk_type = _dblk_type_registry.get(header.type_id, UnknownDBLK)
-	return dblk_type.from_bytes(flb_data[:header.next_offset], header)
+	try:
+		return dblk_type.from_bytes(flb_data[:header.next_offset], header)
+	except Exception:
+		if strict:
+			raise
+		return UnknownDBLK.from_bytes(flb_data[:header.next_offset], header)
