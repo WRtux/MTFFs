@@ -120,6 +120,7 @@ class TapeDBLK(DBLK, Structured):
 assert TapeDBLK._field_struct.size == TAPE_HEADER_SIZE - DB_HDR_SIZE
 
 
+# NOTE: ESET may host other dataset info (backup type, corrupt count)
 @register_dblk_type
 @dataclass(kw_only=True)
 class DatasetDBLK(DBLK, Structured):
@@ -146,7 +147,30 @@ class DatasetDBLK(DBLK, Structured):
 	_mtf_minor_version: int
 	_media_catalog_version: int
 
-	# TODO: Add properties (strings etc.)
+	@property
+	def dataset_name_raw(self) -> memoryview | None:
+		return self._var_field(self._dataset_name_offset, self._dataset_name_size)
+	@property
+	def dataset_name(self) -> str | None:
+		return self._str_field(self._dataset_name_offset, self._dataset_name_size)
+
+	@property
+	def dataset_description_raw(self) -> memoryview | None:
+		return self._var_field(self._dataset_description_offset, self._dataset_description_size)
+	@property
+	def dataset_description(self) -> str | None:
+		return self._str_field(self._dataset_description_offset, self._dataset_description_size)
+
+	@property
+	def dataset_password_raw(self) -> memoryview | None:
+		return self._var_field(self._dataset_password_offset, self._dataset_password_size)
+
+	@property
+	def user_name_raw(self) -> memoryview | None:
+		return self._var_field(self._user_name_offset, self._user_name_size)
+	@property
+	def user_name(self) -> str | None:
+		return self._str_field(self._user_name_offset, self._user_name_size)
 
 	@property
 	def media_write_datetime(self) -> datetime | None:
@@ -205,9 +229,149 @@ class DatasetDBLK(DBLK, Structured):
 assert DatasetDBLK._field_struct.size == 98 - DB_HDR_SIZE
 
 
-# TODO:
-# VolumeDBLK
-# DirectoryDBLK
+@register_dblk_type
+@dataclass(kw_only=True)
+class VolumeDBLK(DBLK, Structured):
+	type_id = KnownDBLK.MTF_VOLB.value
+
+	volume_attributes: int
+	_device_name_size: int
+	_device_name_offset: int
+	_volume_name_size: int
+	_volume_name_offset: int
+	_machine_name_size: int
+	_machine_name_offset: int
+	_media_write_date: bytes
+
+	@property
+	def device_name_raw(self) -> memoryview | None:
+		return self._var_field(self._device_name_offset, self._device_name_size)
+	@property
+	def device_name(self) -> str | None:
+		return self._str_field(self._device_name_offset, self._device_name_size)
+
+	@property
+	def volume_name_raw(self) -> memoryview | None:
+		return self._var_field(self._volume_name_offset, self._volume_name_size)
+	@property
+	def volume_name(self) -> str | None:
+		return self._str_field(self._volume_name_offset, self._volume_name_size)
+
+	@property
+	def machine_name_raw(self) -> memoryview | None:
+		return self._var_field(self._machine_name_offset, self._machine_name_size)
+	@property
+	def machine_name(self) -> str | None:
+		return self._str_field(self._machine_name_offset, self._machine_name_size)
+
+	@property
+	def media_write_datetime(self) -> datetime | None:
+		return parse_datetime(self._media_write_date)
+
+	_field_specs = (
+		('volume_attributes', 'I'),
+		('_device_name_size', 'H'),
+		('_device_name_offset', 'H'),
+		('_volume_name_size', 'H'),
+		('_volume_name_offset', 'H'),
+		('_machine_name_size', 'H'),
+		('_machine_name_offset', 'H'),
+		('_media_write_date', '5s'),
+	)
+
+	_info_specs = (
+		*DBLK._info_specs,
+		('device_name', 'device', '!s'),
+		('volume_name', 'volume', '!s'),
+		('machine_name', 'machine', '!s'),
+		('media_write_datetime', 'time', '!s'),
+	)
+
+	@classmethod
+	def from_bytes(cls, dblk_data: bytes, header: DBHeader) -> Self:
+		if header.type_id != cls.type_id:
+			raise TypeError
+
+		offset = DB_HDR_SIZE
+		field_map = cls._unpack_field_map(dblk_data, offset)
+		offset += cls._field_struct.size
+
+		return cls(header, dblk_data[offset:], extra_offset=offset, **field_map)
+
+assert VolumeDBLK._field_struct.size == 73 - DB_HDR_SIZE
+
+
+@register_dblk_type
+@dataclass(kw_only=True)
+class DirectoryDBLK(DBLK, Structured):
+	type_id = KnownDBLK.MTF_DIRB.value
+
+	directory_attributes: int
+	_modification_date: bytes
+	_creation_date: bytes
+	_backup_date: bytes
+	_access_date: bytes
+	directory_id: int
+	_directory_name_size: int
+	_directory_name_offset: int
+
+	@property
+	def modification_datetime(self) -> datetime | None:
+		return parse_datetime(self._modification_date)
+
+	@property
+	def creation_datetime(self) -> datetime | None:
+		return parse_datetime(self._creation_date)
+
+	@property
+	def backup_datetime(self) -> datetime | None:
+		return parse_datetime(self._backup_date)
+
+	@property
+	def access_datetime(self) -> datetime | None:
+		return parse_datetime(self._access_date)
+
+	@property
+	def directory_name_raw(self) -> memoryview | None:
+		return self._var_field(self._directory_name_offset, self._directory_name_size)
+	@property
+	def directory_name(self) -> str | None:
+		return self._str_field(self._directory_name_offset, self._directory_name_size)
+
+	_field_specs = (
+		('directory_attributes', 'I'),
+		('_modification_date', '5s'),
+		('_creation_date', '5s'),
+		('_backup_date', '5s'),
+		('_access_date', '5s'),
+		('directory_id', 'I'),
+		('_directory_name_size', 'H'),
+		('_directory_name_offset', 'H'),
+	)
+
+	_info_specs = (
+		*DBLK._info_specs,
+		('directory_id', 'dir', 'd'),
+		('directory_name', 'name', '!s'),
+		('modification_datetime', 'mtime', '!s'),
+		('creation_datetime', 'btime', '!s'),
+		('backup_datetime', 'rtime', '!s'),
+		('access_datetime', 'atime', '!s'),
+	)
+
+	@classmethod
+	def from_bytes(cls, dblk_data: bytes, header: DBHeader) -> Self:
+		if header.type_id != cls.type_id:
+			raise TypeError
+
+		offset = DB_HDR_SIZE
+		field_map = cls._unpack_field_map(dblk_data, offset)
+		offset += cls._field_struct.size
+
+		return cls(header, dblk_data[offset:], extra_offset=offset, **field_map)
+
+assert DirectoryDBLK._field_struct.size == 84 - DB_HDR_SIZE
+
 
 @register_dblk_type
 @dataclass(kw_only=True)
