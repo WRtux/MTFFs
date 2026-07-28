@@ -11,37 +11,28 @@ import struct
 import pytest
 
 from mtf_parser.parser import (
-	DBHeader,
-	StreamHeader,
 	StreamInfo,
 	MTFParseError,
 	parse_mtf_dblk,
 	_skip_and_collect_streams,
 )
-from mtf_parser.constants import (
+from mtf_parser.mtf.constants import (
+	KnownDBLK, KnownStream,
 	DB_HDR_SIZE,
 	STREAM_HDR_SIZE,
-	FLB_512,
-	FLB_1024,
-	MTF_TAPE,
-	MTF_SSET,
-	MTF_VOLB,
-	MTF_DIRB,
-	MTF_FILE,
-	MTF_CFIL,
-	MTF_ESET,
-	MTF_SFMB,
-	STREAM_PAD,
-	STREAM_CORRUPT,
+	VALID_FLB_SIZES,
 )
+from mtf_parser.mtf.common import DBHeader, StreamHeader
 
 
 # ═══════════════════════════════════════════════════════════════════
 # Test helpers
 # ═══════════════════════════════════════════════════════════════════
 
+_DEFAULT_FLB_SIZE = 512
+
 def make_db_header(
-	dblk_type: bytes = MTF_TAPE,
+	dblk_type: KnownDBLK | bytes = KnownDBLK.MTF_TAPE,
 	block_attrs: int = 0,
 	offset_to_first: int = 100,
 	os_id: int = 14,            # Windows NT
@@ -63,9 +54,10 @@ def make_db_header(
 	reserved_4 = b"\x00" * 4
 	reserved_1 = b"\x00"
 	os_specific = struct.pack("<HH", os_specific_size, os_specific_offset)
+	type_bytes = dblk_type.value if isinstance(dblk_type, KnownDBLK) else bytes(dblk_type)
 
 	header = (
-		dblk_type                             #  0: 4
+		type_bytes                             #  0: 4
 		+ struct.pack("<I", block_attrs)       #  4: 4
 		+ struct.pack("<H", offset_to_first)   #  8: 2
 		+ struct.pack("B", os_id)              # 10: 1
@@ -87,14 +79,14 @@ def make_db_header(
 
 
 def make_stream_header(
-	stream_type: bytes = STREAM_PAD,
+	stream_type: KnownStream = KnownStream.STREAM_PAD,
 	length: int = 0,
 	fs_attrs: int = 0,
 	media_attrs: int = 0,
 ) -> bytes:
 	"""Build a valid 22-byte Stream Header."""
 	return (
-		stream_type
+		stream_type.value
 		+ struct.pack("<H", fs_attrs)
 		+ struct.pack("<H", media_attrs)
 		+ struct.pack("<Q", length)
@@ -105,7 +97,7 @@ def make_stream_header(
 
 
 def make_tape_dblk(
-	flb_size: int = FLB_512,
+	flb_size: int = _DEFAULT_FLB_SIZE,
 	sfmb_block_size: int = 0,
 ) -> bytes:
 	"""Build a minimal MTF_TAPE DBLK large enough to contain the FLB size field.
@@ -121,7 +113,7 @@ def make_tape_dblk(
 	body = bytearray(94 + 2)
 	# Common Block Header at bytes 0-51
 	body[:52] = make_db_header(
-		MTF_TAPE,
+		KnownDBLK.MTF_TAPE,
 		offset_to_first=94 + 2,
 		fla=0,
 		os_id=14,
@@ -133,7 +125,7 @@ def make_tape_dblk(
 	return bytes(body)
 
 
-def build_minimal_bkf(flb_size: int = FLB_512) -> bytes:
+def build_minimal_bkf(flb_size: int = _DEFAULT_FLB_SIZE) -> bytes:
 	"""Build a minimal valid MTF file in memory.
 
 	Layout (one medium, one Data Set, no filemarks — disk model):
@@ -142,7 +134,7 @@ def build_minimal_bkf(flb_size: int = FLB_512) -> bytes:
 	Each non-TAPE DBLK is exactly the 52-byte header (next_offset = 52
 	points to the SPAD stream immediately after).
 	"""
-	def db_header(dblk_type: bytes, fla: int = 0) -> bytes:
+	def db_header(dblk_type: KnownDBLK, fla: int = 0) -> bytes:
 		return make_db_header(
 			dblk_type=dblk_type,
 			offset_to_first=52,
@@ -152,7 +144,7 @@ def build_minimal_bkf(flb_size: int = FLB_512) -> bytes:
 		)
 
 	def spad_stream(pad_bytes: int) -> bytes:
-		return make_stream_header(STREAM_PAD, length=pad_bytes) + b"\x00" * pad_bytes
+		return make_stream_header(KnownStream.STREAM_PAD, length=pad_bytes) + b"\x00" * pad_bytes
 
 	tape_dblk = make_tape_dblk(flb_size)
 
@@ -166,15 +158,15 @@ def build_minimal_bkf(flb_size: int = FLB_512) -> bytes:
 	return (
 		tape_dblk
 		+ spad_stream(pad_tape)
-		+ db_header(MTF_SSET, fla=fla)
+		+ db_header(KnownDBLK.MTF_SSET, fla=fla)
 		+ spad_stream(pad_other)
-		+ db_header(MTF_ESET, fla=fla + pad_other // flb_size)
+		+ db_header(KnownDBLK.MTF_ESET, fla=fla + pad_other // flb_size)
 		+ spad_stream(pad_other)
 	)
 
 
 def build_bkf_with_files(
-	flb_size: int = FLB_512,
+	flb_size: int = _DEFAULT_FLB_SIZE,
 	files: list[str] | None = None,
 ) -> bytes:
 	"""Build an MTF file containing a VOLB, DIRB, and FILE DBLKs.
@@ -185,7 +177,7 @@ def build_bkf_with_files(
 		files = ["test.txt"]
 
 	db = lambda t, fla=0: make_db_header(t, offset_to_first=52, fla=fla, os_id=14)
-	spad = lambda n: make_stream_header(STREAM_PAD, length=n) + b"\x00" * n
+	spad = lambda n: make_stream_header(KnownStream.STREAM_PAD, length=n) + b"\x00" * n
 
 	tape_dblk = make_tape_dblk(flb_size)
 	pad_tape = flb_size - 94 - 2 - 22
@@ -196,28 +188,28 @@ def build_bkf_with_files(
 	parts = [tape_dblk, spad(pad_tape)]
 
 	# SSET
-	parts.append(db(MTF_SSET, fla=fla))
+	parts.append(db(KnownDBLK.MTF_SSET, fla=fla))
 	fla += pad_other // flb_size
 	parts.append(spad(pad_other))
 
 	# VOLB
-	parts.append(db(MTF_VOLB, fla=fla))
+	parts.append(db(KnownDBLK.MTF_VOLB, fla=fla))
 	fla += pad_other // flb_size
 	parts.append(spad(pad_other))
 
 	# DIRB
-	parts.append(db(MTF_DIRB, fla=fla))
+	parts.append(db(KnownDBLK.MTF_DIRB, fla=fla))
 	fla += pad_other // flb_size
 	parts.append(spad(pad_other))
 
 	# FILE DBLKs (no actual file data streams — just the DBLK + SPAD)
 	for _ in files:
-		parts.append(db(MTF_FILE, fla=fla))
+		parts.append(db(KnownDBLK.MTF_FILE, fla=fla))
 		fla += pad_other // flb_size
 		parts.append(spad(pad_other))
 
 	# ESET
-	parts.append(db(MTF_ESET, fla=fla))
+	parts.append(db(KnownDBLK.MTF_ESET, fla=fla))
 	fla += pad_other // flb_size
 	parts.append(spad(pad_other))
 
@@ -243,7 +235,7 @@ def make_sfmb_dblk(
 
 	# Common Block Header
 	hdr = make_db_header(
-		dblk_type=MTF_SFMB,
+		KnownDBLK.MTF_SFMB,
 		offset_to_first=block_byte_size,  # next DBLK (no streams)
 		fla=0,
 		os_id=14,
@@ -259,14 +251,14 @@ def make_sfmb_dblk(
 	return bytes(body)
 
 
-def build_bkf_with_sfmb(flb_size: int = FLB_512) -> bytes:
+def build_bkf_with_sfmb(flb_size: int = _DEFAULT_FLB_SIZE) -> bytes:
 	"""Build an MTF file with SFMB blocks between Data Sets.
 
 	Layout:
 		TAPE → SPAD → SSET → SPAD → ESET → SPAD → SFMB → SFMB → ...
 	"""
 	db = lambda t, fla=0: make_db_header(t, offset_to_first=52, fla=fla, os_id=14)
-	spad = lambda n: make_stream_header(STREAM_PAD, length=n) + b"\x00" * n
+	spad = lambda n: make_stream_header(KnownStream.STREAM_PAD, length=n) + b"\x00" * n
 
 	sfmb_block = 2  # 2 × 512 = 1024 bytes per SFMB
 	tape_dblk = make_tape_dblk(flb_size, sfmb_block)
@@ -278,10 +270,10 @@ def build_bkf_with_sfmb(flb_size: int = FLB_512) -> bytes:
 	parts = [tape_dblk, spad(pad_tape)]
 
 	# Data Set 1
-	parts.append(db(MTF_SSET, fla=fla))
+	parts.append(db(KnownDBLK.MTF_SSET, fla=fla))
 	fla += pad_other // flb_size
 	parts.append(spad(pad_other))
-	parts.append(db(MTF_ESET, fla=fla))
+	parts.append(db(KnownDBLK.MTF_ESET, fla=fla))
 	fla += pad_other // flb_size
 	parts.append(spad(pad_other))
 
@@ -301,7 +293,7 @@ class TestDBHeader:
 
 	def test_parse_tape_header(self):
 		raw = make_db_header(
-			dblk_type=MTF_TAPE,
+			KnownDBLK.MTF_TAPE,
 			block_attrs=0x00010000,   # MTF_SET_MAP_EXISTS (BIT16)
 			offset_to_first=200,
 			os_id=14,
@@ -311,19 +303,19 @@ class TestDBHeader:
 		)
 		hdr = DBHeader.from_bytes(raw)
 
-		assert hdr.type_id == MTF_TAPE
+		assert hdr.type_id == KnownDBLK.MTF_TAPE
 		assert hdr.type_name == "MTF_TAPE"
 		assert hdr.block_attributes == 0x00010000
 		assert hdr.next_offset == 200
 		assert hdr._os_id == 14
 		assert hdr._os_version == 0
 		assert hdr.display_size == 0
-		assert hdr.format_logical_address == 0
+		assert hdr.logical_address == 0
 		assert hdr._string_type == 0
 
 	def test_parse_file_header(self):
 		raw = make_db_header(
-			dblk_type=MTF_FILE,
+			KnownDBLK.MTF_FILE,
 			offset_to_first=80,
 			display_size=12345678,
 			fla=42,
@@ -331,9 +323,9 @@ class TestDBHeader:
 		)
 		hdr = DBHeader.from_bytes(raw)
 
-		assert hdr.type_id == MTF_FILE
+		assert hdr.type_id == KnownDBLK.MTF_FILE
 		assert hdr.display_size == 12345678
-		assert hdr.format_logical_address == 42
+		assert hdr.logical_address == 42
 		assert hdr.control_block_id == 7
 
 	def test_continuation_bit(self):
@@ -349,7 +341,7 @@ class TestDBHeader:
 	def test_unknown_type_name(self):
 		raw = make_db_header(dblk_type=b"XYZ!")
 		hdr = DBHeader.from_bytes(raw)
-		assert "UNKNOWN" in hdr.type_name
+		assert hdr.type_name is None
 
 	def test_rejects_short_data(self):
 		with pytest.raises(ValueError):
@@ -364,17 +356,17 @@ class TestStreamHeader:
 	"""Unit tests for the Stream Header parser."""
 
 	def test_parse_standard_data(self):
-		raw = make_stream_header(b"STAN", length=4096)
+		raw = make_stream_header(KnownStream.STREAM_STANDARD, length=4096)
 		sh = StreamHeader.from_bytes(raw)
 
-		assert sh.type_id == b"STAN"
+		assert sh.type_id == KnownStream.STREAM_STANDARD
 		assert sh.length == 4096
 
 	def test_parse_spad(self):
-		raw = make_stream_header(b"SPAD", length=300)
+		raw = make_stream_header(KnownStream.STREAM_PAD, length=300)
 		sh = StreamHeader.from_bytes(raw)
 
-		assert sh.type_id == b"SPAD"
+		assert sh.type_id == KnownStream.STREAM_PAD
 		assert sh.length == 300
 
 	def test_rejects_short_data(self):
@@ -392,14 +384,14 @@ class TestSkipStreams:
 	def test_single_spad(self):
 		spad_len = 100
 		buf = io.BytesIO(
-			make_stream_header(STREAM_PAD, length=spad_len)
+			make_stream_header(KnownStream.STREAM_PAD, length=spad_len)
 			+ b"\x00" * spad_len
 		)
 		next_pos, streams = _skip_and_collect_streams(buf, start_pos=0)
 		# 22 (header) + 100 (data) = 122
 		assert next_pos == 22 + spad_len
 		assert len(streams) == 1
-		assert streams[0].type_id == STREAM_PAD
+		assert streams[0].type_id == KnownStream.STREAM_PAD
 		assert streams[0].length == 100
 		assert streams[0].file_offset == 0
 
@@ -410,41 +402,43 @@ class TestSkipStreams:
 		next stream header (Stream Alignment Factor = 4, Section 3.5.2).
 		"""
 		buf = io.BytesIO(
-			make_stream_header(b"STAN", length=100)
+			make_stream_header(KnownStream.STREAM_STANDARD, length=100)
 			+ b"\x00" * 100
 			+ b"\x00" * 2
-			+ make_stream_header(b"CSUM", length=8)
+			+ make_stream_header(KnownStream.STREAM_CHECKSUM, length=8)
 			+ b"\x00" * 8
 			+ b"\x00" * 2
-			+ make_stream_header(STREAM_PAD, length=50)
+			+ make_stream_header(KnownStream.STREAM_PAD, length=50)
 			+ b"\x00" * 50
 		)
 		next_pos, streams = _skip_and_collect_streams(buf, start_pos=0)
 		assert next_pos == 228
 
 		assert len(streams) == 3
-		assert streams[0].type_id == b"STAN"
+		assert streams[0].type_id == KnownStream.STREAM_STANDARD
 		assert streams[0].length == 100
-		assert streams[1].type_id == b"CSUM"
+		assert streams[1].type_id == KnownStream.STREAM_CHECKSUM
 		assert streams[1].length == 8
-		assert streams[2].type_id == STREAM_PAD
+		assert streams[2].type_id == KnownStream.STREAM_PAD
 		assert streams[2].length == 50
 
-	def test_corrupt_stream_raises(self):
+	def test_corrupt_stream(self, caplog):
 		buf = io.BytesIO(
-			make_stream_header(STREAM_CORRUPT, length=0)
-			+ make_stream_header(STREAM_PAD, length=10)
+			make_stream_header(KnownStream.STREAM_CORRUPT, length=0)
+			+ b"\x00" * 2
+			+ make_stream_header(KnownStream.STREAM_PAD, length=10)
 			+ b"\x00" * 10
 		)
-		with pytest.raises(MTFParseError, match="[Cc]orrupt"):
+		with caplog.at_level(logging.ERROR):
 			_skip_and_collect_streams(buf, start_pos=0)
+		assert "corrupt" in caplog.text.casefold()
 
 	def test_zero_length_non_spad_stream(self):
 		"""A stream with zero data length still advances past its header + alignment."""
 		buf = io.BytesIO(
-			make_stream_header(b"STAN", length=0)
+			make_stream_header(KnownStream.STREAM_STANDARD, length=0)
 			+ b"\x00" * 2
-			+ make_stream_header(STREAM_PAD, length=100)
+			+ make_stream_header(KnownStream.STREAM_PAD, length=100)
 			+ b"\x00" * 100
 		)
 		next_pos, streams = _skip_and_collect_streams(buf, start_pos=0)
@@ -460,25 +454,19 @@ class TestSkipStreams:
 class TestParseMTF:
 	"""Integration tests for the full parse_mtf_dblk traversal."""
 
-	def test_minimal_bkf_512(self):
-		buf = io.BytesIO(build_minimal_bkf(FLB_512))
-		results = parse_mtf_dblk(buf)
+	def test_minimal_bkf_flb_size(self):
+		for flb_size in VALID_FLB_SIZES:
+			buf = io.BytesIO(build_minimal_bkf(flb_size))
+			results = parse_mtf_dblk(buf)
 
-		assert len(results) == 3
-		assert results[0].type_name == "MTF_TAPE"
-		assert results[0].file_offset == 0
-		assert results[1].type_name == "MTF_SSET"
-		assert results[2].type_name == "MTF_ESET"
-
-	def test_minimal_bkf_1024(self):
-		buf = io.BytesIO(build_minimal_bkf(FLB_1024))
-		results = parse_mtf_dblk(buf)
-
-		assert len(results) == 3
-		assert results[2].type_name == "MTF_ESET"
+			assert len(results) == 3
+			assert results[0].type_name == "MTF_TAPE"
+			assert results[0].file_offset == 0
+			assert results[1].type_name == "MTF_SSET"
+			assert results[2].type_name == "MTF_ESET"
 
 	def test_bkf_with_files(self):
-		buf = io.BytesIO(build_bkf_with_files(FLB_512, files=["a.txt", "b.dat"]))
+		buf = io.BytesIO(build_bkf_with_files(_DEFAULT_FLB_SIZE, files=["a.txt", "b.dat"]))
 		results = parse_mtf_dblk(buf)
 
 		types = [r.type_name for r in results]
@@ -492,11 +480,10 @@ class TestParseMTF:
 			"MTF_ESET",
 		]
 
-	def test_corrupt_file_detected(self):
-		"""A file containing a CFIL DBLK should raise MTFParseError."""
-		flb = FLB_512
+	def test_corrupt_file_detected(self, caplog):
+		flb = _DEFAULT_FLB_SIZE
 		db = lambda t, fla=0: make_db_header(t, offset_to_first=52, fla=fla, os_id=14)
-		spad = lambda n: make_stream_header(STREAM_PAD, length=n) + b"\x00" * n
+		spad = lambda n: make_stream_header(KnownStream.STREAM_PAD, length=n) + b"\x00" * n
 
 		tape_dblk = make_tape_dblk(flb)
 		pad_tape = flb - 94
@@ -505,11 +492,12 @@ class TestParseMTF:
 
 		buf = io.BytesIO(
 			tape_dblk + spad(pad_tape)
-			+ db(MTF_SSET, fla=fla) + spad(pad_other)
-			+ db(MTF_CFIL, fla=fla + pad_other // flb) + spad(pad_other)
+			+ db(KnownDBLK.MTF_SSET, fla=fla) + spad(pad_other)
+			+ db(KnownDBLK.MTF_CFIL, fla=fla + pad_other // flb) + spad(pad_other)
 		)
-		with pytest.raises(MTFParseError, match="[Cc]orrupt"):
+		with caplog.at_level(logging.ERROR):
 			parse_mtf_dblk(buf)
+		assert "corrupt" in caplog.text.casefold()
 
 	def test_missing_tape_header(self):
 		"""A file without MTF_TAPE at offset 0 should fail immediately."""
@@ -525,7 +513,7 @@ class TestParseMTF:
 	def test_invalid_flb_size(self, caplog):
 		"""An MTF_TAPE with an unsupported FLB size should cause warning."""
 		tape = make_tape_dblk(256)  # 256 is not a valid FLB size
-		spad = make_stream_header(STREAM_PAD, length=0)
+		spad = make_stream_header(KnownStream.STREAM_PAD, length=0)
 		buf = io.BytesIO(tape + spad)
 		with caplog.at_level(logging.WARNING):
 			parse_mtf_dblk(buf)
@@ -541,7 +529,7 @@ class TestSFMB:
 
 	def test_bkf_with_sfmb_parses(self):
 		"""A file with SFMB blocks between Data Sets should parse cleanly."""
-		buf = io.BytesIO(build_bkf_with_sfmb(FLB_512))
+		buf = io.BytesIO(build_bkf_with_sfmb())
 		results = parse_mtf_dblk(buf)
 
 		types = [r.type_name for r in results]
@@ -553,12 +541,12 @@ class TestSFMB:
 			"MTF_SFMB",
 		]
 		# SFMB blocks should have no streams
-		assert len(results[3].streams) == 0
-		assert len(results[4].streams) == 0
+		assert not results[3].streams
+		assert not results[4].streams
 
 	def test_sfmb_offsets(self):
 		"""SFMB blocks should advance by exactly sfmb_byte_size bytes."""
-		buf = io.BytesIO(build_bkf_with_sfmb(FLB_512))
+		buf = io.BytesIO(build_bkf_with_sfmb())
 		results = parse_mtf_dblk(buf)
 
 		sfmb0 = results[3]  # first SFMB
@@ -569,7 +557,7 @@ class TestSFMB:
 	# NOTE: Problematic test design
 	#def test_sfmb_after_data_set(self):
 	# 	"""Verify SFMB appears after ESET in the expected layout."""
-	# 	buf = io.BytesIO(build_bkf_with_sfmb(FLB_512))
+	# 	buf = io.BytesIO(build_bkf_with_sfmb(_DEFAULT_FLB_SIZE))
 	# 	results = parse_mtf_dblk(buf)
 
 	# 	# ESET should be immediately followed by SFMB (no gap)
