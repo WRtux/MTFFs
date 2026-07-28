@@ -242,33 +242,34 @@ def _skip_and_collect_streams(
 	while True:
 		f.seek(pos)
 		raw_hdr = _read_exact(f, STREAM_HDR_SIZE)
-		sh = StreamHeader.from_bytes(raw_hdr, strict_checksum=strict)
 
-		if sh.type_id in KnownDBLK:
+		if raw_hdr[:4] in KnownDBLK:
 			if not expect_dblk:
 				_log.warning(f"Unexpected DBLK at offset {pos :#x} when parsing stream")
 			return pos, streams
-		if _log.isEnabledFor(logging.DEBUG):
-			_log.debug(f"Stream, offset {pos :#x}: {sh !r}")
 
-		stream_data = _read_exact(f, sh.length) if sh.length <= 256 else None
-		streams.append(StreamInfo.from_header(sh, stream_data, file_offset=pos))
+		stream_hdr = StreamHeader.from_bytes(raw_hdr, strict_checksum=strict)
+		if _log.isEnabledFor(logging.DEBUG):
+			_log.debug(f"Stream, offset {pos :#x}: {stream_hdr !r}")
+
+		stream_data = _read_exact(f, stream_hdr.length) if stream_hdr.length <= 256 else None
+		streams.append(StreamInfo.from_header(stream_hdr, stream_data, file_offset=pos))
 
 		# Stream data starts immediately after the 22-byte header.
 		data_start = pos + STREAM_HDR_SIZE
 
-		if sh.type_id == KnownStream.STREAM_PAD:
+		if stream_hdr.type_id == KnownStream.STREAM_PAD:
 			# SPAD data fills exactly to the next FLB boundary.
-			return data_start + sh.length, streams
+			return data_start + stream_hdr.length, streams
 
-		if sh.type_id == KnownStream.STREAM_CORRUPT:
+		if stream_hdr.type_id == KnownStream.STREAM_CORRUPT:
 			_log.error(f"Corrupt stream marker at offset {pos :#x}")
 
 		# Non-SPAD stream: skip header + declared data length,
 		# then realign to 4-byte boundary for the next stream header.
-		pos = data_start + sh.length
+		pos = data_start + stream_hdr.length
 		# NOTE: Special stream type observed which bypass alignment
-		if sh.type_id != b'CPAD' and pos % 4 != 0:
+		if stream_hdr.type_id != b'CPAD' and pos % 4 != 0:
 			pos = (pos + 4 - 1) & ~(4 - 1)
 
 

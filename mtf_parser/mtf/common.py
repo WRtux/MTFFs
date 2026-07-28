@@ -11,21 +11,23 @@ _log = logging.getLogger(__name__)
 
 
 def _verify_checksum(
-	data: bytes, expected: int | bytes,
+	data: bytes, checksum: int | bytes,
 	msg: str | None =None, *,
 	strict_checksum: bool =False,
 ) -> bool:
-	"""Verify word-wise XOR checksum.  Warn or raise on mismatch."""
-	checksum = expected if isinstance(expected, int) else int.from_bytes(expected, 'little')
-	actual = xor_checksum(data)
+	"""Verify word-wise XOR checksum.
+	If *strict_checksum* is True raises ``ValueError`` on mismatch; otherwise logs an error.
+	"""
+	checksum = checksum if isinstance(checksum, int) else int.from_bytes(checksum, 'little')
+	value = xor_checksum(data)
 
-	if actual != checksum:
-		msg = msg or "Checksum mismatch"
-		msg = f"{msg}: Expected {checksum :#06x}, computed {actual :#06x}"
+	if value != 0:
+		msg = msg or "Checksum error"
+		msg = f"{msg}: Computed sum {value :#06x} (expected 0), checksum value {checksum :#06x}"
 
 		if strict_checksum:
 			raise ValueError(msg)
-		_log.warning(msg)
+		_log.error(msg)
 		return False
 	return True
 
@@ -50,7 +52,8 @@ class DBHeader(InfoExtractable, Structured):
 	_os_specific_size: int       # offset 44: uint16 — size of OS-specific data area
 	_os_specific_offset: int     # offset 46: uint16 — offset to OS-specific data
 	_string_type: int            # offset 48: uint8  — 0=none, 1=ANSI, 2=Unicode
-	_checksum: bytes = field(repr=False)
+	_reserved__49: bytes = field(default=b'\0', repr=False)
+	_checksum: bytes | None = field(default=None, repr=False)
 
 	@property
 	def type_name(self) -> str | None:
@@ -58,12 +61,7 @@ class DBHeader(InfoExtractable, Structured):
 
 	@property
 	def is_checksum_correct(self) -> bool:
-		import struct
-		field_map = dataclasses.asdict(self)
-		data = self._field_struct.pack(*(
-				field_map[key] if key is not None else bytes(struct.calcsize(format_def))
-			for key, format_def in self._field_specs)) # TODO: Add a public, rigorous interface
-		return xor_checksum(data) == 0
+		return self._checksum is None or self._checksum == self.compute_checksum()
 	@property
 	def _is_metadata_corrupt(self) -> bool:
 		return not self.is_checksum_correct
@@ -92,7 +90,7 @@ class DBHeader(InfoExtractable, Structured):
 		('_os_specific_size', 'H'),
 		('_os_specific_offset', 'H'),
 		('_string_type', 'B'),
-		(None, '1s'),
+		('_reserved__49', '1s'), # NOTE: Non-zero data observed; stored to make checksum match
 		('_checksum', '2s'),
 	)
 
@@ -109,20 +107,29 @@ class DBHeader(InfoExtractable, Structured):
 	def from_bytes(cls, data: bytes, *, strict_checksum: bool = False) -> Self:
 		"""Unpack a 52-byte Common Block Header.
 
-		If *strict_checksum* is True raises ``ValueError`` on mismatch;
-		otherwise logs a warning.
+		If *strict_checksum* is True raises ``ValueError`` on mismatch.
 		"""
 		if (size := len(data)) != (struct_size := cls._field_struct.size):
 			raise ValueError(f"Expected {struct_size} bytes for DB_HDR, got {size}")
 
 		field_map = cls._unpack_field_map(data)
-		# Checksum covers all bytes except the last 2
-		_verify_checksum(
-			data[:struct_size - 2], field_map['_checksum'],
-			"DBHeader checksum mismatch",
-			strict_checksum=strict_checksum)
+		if strict_checksum or field_map['_checksum'] != b'\0' * 2:
+			_verify_checksum(
+				data, field_map['_checksum'],
+				msg="DBHeader checksum mismatch",
+				strict_checksum=strict_checksum)
 
 		return cls(**field_map)
+
+	def compute_checksum(self) -> bytes:
+		import struct
+		field_map = dataclasses.asdict(self)
+		field_map['_checksum'] = b'\0' * 2
+		data = self._field_struct.pack(*(
+				field_map[key] if key is not None else bytes(struct.calcsize(format_def))
+			for key, format_def in self._field_specs)) # TODO: Add a public, rigorous interface
+		checksum = xor_checksum(data).to_bytes(2, 'little')
+		return checksum
 
 assert DBHeader._field_struct.size == DB_HDR_SIZE
 
@@ -136,16 +143,11 @@ class StreamHeader(Structured):
 	length: int
 	_encryption_algo: int
 	_compression_algo: int
-	_checksum: bytes = field(repr=False)
+	_checksum: bytes | None = field(default=None, repr=False)
 
 	@property
 	def is_checksum_correct(self) -> bool:
-		import struct
-		field_map = dataclasses.asdict(self)
-		data = self._field_struct.pack(*(
-				field_map[key] if key is not None else bytes(struct.calcsize(format_def))
-			for key, format_def in self._field_specs)) # TODO: Add a public, rigorous interface
-		return xor_checksum(data) == 0
+		return self._checksum is None or self._checksum == self.compute_checksum()
 	@property
 	def _is_metadata_corrupt(self) -> bool:
 		return not self.is_checksum_correct
@@ -164,20 +166,29 @@ class StreamHeader(Structured):
 	def from_bytes(cls, data: bytes, *, strict_checksum: bool = False) -> Self:
 		"""Unpack a 22-byte Stream Header.
 
-		If *strict_checksum* is True raises ``ValueError`` on mismatch;
-		otherwise logs a warning.
+		If *strict_checksum* is True raises ``ValueError`` on mismatch.
 		"""
 		if (size := len(data)) != (struct_size := cls._field_struct.size):
 			raise ValueError(f"Expected {struct_size} bytes for Stream Header, got {size}")
 
 		field_map = cls._unpack_field_map(data)
-		# Checksum covers all bytes except the last 2
-		_verify_checksum(
-			data[:struct_size - 2], field_map['_checksum'],
-			"StreamHeader checksum mismatch",
-			strict_checksum=strict_checksum)
+		if strict_checksum or field_map['_checksum'] != b'\0' * 2:
+			_verify_checksum(
+				data, field_map['_checksum'],
+				msg="StreamHeader checksum mismatch",
+				strict_checksum=strict_checksum)
 
 		return cls(**field_map)
+
+	def compute_checksum(self) -> bytes:
+		import struct
+		field_map = dataclasses.asdict(self)
+		field_map['_checksum'] = b'\0' * 2
+		data = self._field_struct.pack(*(
+				field_map[key] if key is not None else bytes(struct.calcsize(format_def))
+			for key, format_def in self._field_specs)) # TODO
+		checksum = xor_checksum(data).to_bytes(2, 'little')
+		return checksum
 
 assert StreamHeader._field_struct.size == STREAM_HDR_SIZE
 
