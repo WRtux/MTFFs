@@ -1,5 +1,6 @@
 import dataclasses
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import ClassVar, Self, overload
 
@@ -60,6 +61,10 @@ class DBHeader(InfoExtractable, Structured):
 		return DBLK_TYPE_NAME_MAP.get(self.type_id, None)
 
 	@property
+	def _string_encoding(self) -> str | None:
+		return { 0: None, 1: 'ascii', 2: 'utf-16-le' }[self._string_type]
+
+	@property
 	def is_checksum_correct(self) -> bool:
 		return self._checksum is None or self._checksum == self.compute_checksum()
 	@property
@@ -70,10 +75,6 @@ class DBHeader(InfoExtractable, Structured):
 	def is_continuation(self) -> bool:
 		"""BIT0: this DBLK is a continuation from a previous medium."""
 		return bool(self.block_attributes & 0x00000001)
-
-	@property
-	def _string_encoding(self) -> str | None:
-		return { 0: None, 1: 'ascii', 2: 'utf-16-le' }[self._string_type]
 
 	_field_specs = (
 		('type_id', '4s'),
@@ -206,6 +207,14 @@ class DBLK(InfoExtractable):
 		return DBLK_TYPE_NAME_MAP[self.type_id]
 
 	@property
+	def fla(self) -> int | None:
+		return self.header.logical_address
+
+	@property
+	def cbid(self) -> int | None:
+		return self.header.control_block_id
+
+	@property
 	def _display_size(self) -> int | None:
 		# NOTE: May not have meaning in many types
 		return self.header.display_size if self.header.display_size else None
@@ -215,6 +224,7 @@ class DBLK(InfoExtractable):
 		return self._var_field(self.header._os_specific_offset, self.header._os_specific_size)
 
 	_info_specs = (
+		# TODO: Move CB, FLA here
 		('_display_size', 'display_size?', ',d'), # Guard if not none
 		# NOTE Displayable size also observed in: SSET SFMB
 	)
@@ -282,9 +292,22 @@ class UnknownDBLK(DBLK):
 
 _dblk_type_registry: dict[bytes, type[DBLK]] = dict()
 
-def register_dblk_type[Z: type[DBLK]](cls: Z) -> Z:
-	_dblk_type_registry[cls.type_id] = cls
-	return cls
+@overload
+def register_dblk_type[Z: type[DBLK]](dblk_type: Z) -> Z: ...
+@overload
+def register_dblk_type[Z: type[DBLK]](dblk_type: bytes) -> Callable[[Z], Z]: ...
+def register_dblk_type[Z: type[DBLK]](dblk_type: Z | bytes) -> Z | Callable[[Z], Z]:
+	type_id = dblk_type.type_id if isinstance(dblk_type, type) else dblk_type
+	assert isinstance(type_id, bytes)
+
+	def register(cls: Z) -> Z:
+		_dblk_type_registry[type_id] = cls
+		return cls
+
+	if isinstance(dblk_type, type):
+		return register(dblk_type)
+	else:
+		return register
 
 def parse_dblk(flb_data: bytes, *, strict: bool = False) -> DBLK:
 	header = DBHeader.from_bytes(flb_data[:DB_HDR_SIZE], strict_checksum=strict)

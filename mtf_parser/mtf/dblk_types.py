@@ -120,7 +120,6 @@ class TapeDBLK(DBLK, Structured):
 assert TapeDBLK._field_struct.size == TAPE_HEADER_SIZE - DB_HDR_SIZE
 
 
-# NOTE: ESET may host other dataset info (backup type, corrupt count)
 @register_dblk_type
 @dataclass(kw_only=True)
 class DatasetDBLK(DBLK, Structured):
@@ -429,6 +428,7 @@ class FileDBLK(DBLK, Structured):
 
 	_info_specs = (
 		('directory_id', 'dir', 'd'),
+		('file_id', 'file', 'd'),
 		('file_name', 'name', '!s'),
 		('display_size', 'size', ',d'),
 		('modification_datetime', 'mtime', '!s'),
@@ -452,8 +452,188 @@ class FileDBLK(DBLK, Structured):
 assert FileDBLK._field_struct.size == 88 - DB_HDR_SIZE
 
 
-# TODO:
-# DatasetEndDBLK
-# TapeEndMarkerDBLK
-# CorruptionDBLK
-# PaddingDBLK (ESPB, SFMB)
+@register_dblk_type
+@dataclass(kw_only=True)
+class DatasetEndDBLK(DBLK, Structured):
+	"""End of Data Set DBLK (MTF_ESET, Structure 12).
+
+	Marks the end of a Data Set.  Duplicates the Data Set Number
+	and Media Write Date from MTF_SSET for cross-reference.
+	"""
+
+	type_id = KnownDBLK.MTF_ESET.value
+
+	backup_attributes: int
+	corrupt_file_num: int
+	_reserved_mbc_pba_1: int
+	_reserved_mbc_pba_2: int
+	_fdd_media_index: int
+	dataset_index: int
+	_media_write_date: bytes
+
+	@property
+	def media_write_datetime(self) -> datetime | None:
+		return parse_datetime(self._media_write_date)
+
+	_field_specs = (
+		('backup_attributes', 'I'),
+		('corrupt_file_num', 'I'),
+		('_reserved_mbc_pba_1', 'Q'),
+		('_reserved_mbc_pba_2', 'Q'),
+		('_fdd_media_index', 'H'),
+		('dataset_index', 'H'),
+		('_media_write_date', '5s'),
+	)
+
+	_info_specs = (
+		*DBLK._info_specs,
+		('dataset_index', 'index', 'd'),
+		('media_write_datetime', 'time', '!s'),
+		('corrupt_file_num', 'corrupt_num', 'd'),
+	)
+
+	@classmethod
+	def from_bytes(cls, dblk_data: bytes, header: DBHeader) -> Self:
+		if header.type_id != cls.type_id:
+			raise TypeError
+
+		offset = DB_HDR_SIZE
+		field_map = cls._unpack_field_map(dblk_data, offset)
+		offset += cls._field_struct.size
+
+		return cls(header, dblk_data[offset:], extra_offset=offset, **field_map)
+
+assert DatasetEndDBLK._field_struct.size == 85 - DB_HDR_SIZE
+
+
+@register_dblk_type
+@dataclass(kw_only=True)
+class TapeEndMarkerDBLK(DBLK, Structured):
+	"""End of Tape Marker DBLK (MTF_EOTM, Structure 13).
+
+	Indicates End Of Media was reached — the Media Family continues
+	onto another volume.
+	"""
+
+	type_id = KnownDBLK.MTF_EOTM.value
+
+	_last_eset_pba: int
+
+	@property
+	def _is_no_eset_pba(self) -> bool:
+		"""BIT16: no Data Set ends on this tape."""
+		return bool(self.header.block_attributes & 0x00010000)
+
+	@property
+	def _is_eset_pba_invalid(self) -> bool:
+		"""BIT17: the PBA of the last ESET is invalid."""
+		return bool(self.header.block_attributes & 0x00020000)
+
+	_field_specs = (
+		('_last_eset_pba', 'Q'),
+	)
+
+	_info_specs = (
+		# TODO: Organize attributes
+		('_is_no_eset_pba', 'is_no_ESET', None),
+		('_is_eset_pba_invalid', 'is_PBA_invalid', None),
+	)
+
+	@classmethod
+	def from_bytes(cls, dblk_data: bytes, header: DBHeader) -> Self:
+		if header.type_id != cls.type_id:
+			raise TypeError
+
+		offset = DB_HDR_SIZE
+		field_map = cls._unpack_field_map(dblk_data, offset)
+		offset += cls._field_struct.size
+
+		return cls(header, dblk_data[offset:], extra_offset=offset, **field_map)
+
+	def _extract_info(self):
+		info_map = super()._extract_info()
+		del info_map['CB'], info_map['FLA']
+		return info_map
+
+assert TapeEndMarkerDBLK._field_struct.size == 60 - DB_HDR_SIZE
+
+
+@register_dblk_type
+@dataclass(kw_only=True)
+class CorruptionDBLK(DBLK, Structured):
+	"""Corrupt Object DBLK (MTF_CFIL, Structure 10).
+
+	Indicates data associated with the previous DBLK could not be
+	fully read.  Specifies which stream is corrupt and the byte
+	offset where the corruption began.
+	"""
+
+	type_id = KnownDBLK.MTF_CFIL.value
+
+	corruption_attributes: int
+	stream_offset: int
+	corrupt_stream_index: int
+
+	_field_specs = (
+		('corruption_attributes', 'I'),
+		(None, '8s'),
+		('stream_offset', 'Q'),
+		('corrupt_stream_index', 'H'),
+	)
+
+	_info_specs = (
+		# NOTE: Maybe incomplete; lacks samples
+		('corrupt_stream_index', 'stream_index', 'd'),
+		('stream_offset', 'stream_offset', '#x'),
+	)
+
+	@classmethod
+	def from_bytes(cls, dblk_data: bytes, header: DBHeader) -> Self:
+		if header.type_id != cls.type_id:
+			raise TypeError
+
+		offset = DB_HDR_SIZE
+		field_map = cls._unpack_field_map(dblk_data, offset)
+		offset += cls._field_struct.size
+
+		return cls(header, dblk_data[offset:], extra_offset=offset, **field_map)
+
+assert CorruptionDBLK._field_struct.size == 74 - DB_HDR_SIZE
+
+
+# Register more types if needed
+@register_dblk_type(KnownDBLK.MTF_ESPB.value)
+@dataclass(kw_only=True)
+class PaddingDBLK(DBLK):
+	"""End of Set Pad DBLK (MTF_ESPB, Structure 11) or any padding purpose DBLK types.
+
+	Pads zeroes to the next physical block boundary when the
+	physical block size exceeds the Format Logical Block size.
+	No fields beyond the Common Block Header.
+	"""
+
+	@property
+	def type_id(self) -> bytes:
+		return self.header.type_id
+
+	@classmethod
+	def from_bytes(cls, dblk_data: bytes, header: DBHeader) -> Self:
+		return cls(header, dblk_data[DB_HDR_SIZE:], extra_offset=DB_HDR_SIZE)
+
+
+@register_dblk_type
+@dataclass(kw_only=True)
+class SoftFilemarkDBLK(DBLK):
+	"""Soft Filemark DBLK (MTF_SFMB, Structure 14).
+
+	Emulates tape filemarks on media without hardware filemark
+	support. Fields are unconcerned. No associated data streams.
+	"""
+
+	type_id = KnownDBLK.MTF_SFMB.value
+
+	@classmethod
+	def from_bytes(cls, dblk_data: bytes, header: DBHeader) -> Self:
+		if header.type_id != cls.type_id:
+			raise TypeError
+		return cls(header, dblk_data[DB_HDR_SIZE:], extra_offset=DB_HDR_SIZE)
