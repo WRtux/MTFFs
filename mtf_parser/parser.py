@@ -13,7 +13,7 @@ Parsing strategy (linear traversal, no filemarks on disk):
 
 import itertools
 import logging
-from collections.abc import Buffer, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import BinaryIO, Self, TextIO
 
@@ -183,6 +183,33 @@ class StreamInfo:
 		return f"{self.type_name}({content_str})"
 
 
+# TODO: Move to common classes
+@dataclass(kw_only=False)
+class StreamAccess:
+	header: StreamHeader
+
+	source: BinaryIO
+	_valid: bool | None = field(default=True, init=False, compare=False)
+
+	@property
+	def size(self) -> int:
+		return self.header.length
+
+	def data_access(self) -> Callable[..., bytes]:
+		if not self._valid:
+			raise IOError("Data is no longer available")
+		self._valid = None
+
+		offset = 0
+		def read(size: int =-1) -> bytes:
+			assert self._valid is None
+			remain = self.size - offset
+			size = min(size, remain) if size >= 0 else remain
+			return self.source.read(size)
+
+		return read
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Exception
 # ═══════════════════════════════════════════════════════════════════
@@ -199,13 +226,12 @@ class MTFParseError(Exception):
 def _read_exact(f: BinaryIO, size: int) -> bytes:
 	"""Read exactly `size` bytes from `f` or raise EOFError."""
 	data = f.read(size)
-	if len(data) < size:
-		offset = f.tell() - len(data)
+	if (data_size := len(data)) < size:
+		offset = f.tell() - data_size
 		end = f.seek(0, 2)
 		raise EOFError(
 			f"Expected {size} bytes at offset {offset :#x} (approx), "
-			f"reached end at {end :#x}"
-		)
+			f"reached end at {end :#x}")
 	return data
 
 
@@ -213,12 +239,12 @@ def _read_exact(f: BinaryIO, size: int) -> bytes:
 # Stream traversal (single-pass: skip + collect metadata)
 # ═══════════════════════════════════════════════════════════════════
 
-def _skip_and_collect_streams(
+def _dblk_stream_accessor(
 	f: BinaryIO,
 	start_pos: int, *,
 	expect_dblk: bool =False,
 	strict: bool =False,
-) -> tuple[int, list[StreamInfo]]:
+) -> Iterator[StreamAccess]:
 	"""Skip over data streams, collecting StreamInfo on the way.
 
 	Reads each Stream Header once — no separate counting pass.
@@ -232,45 +258,57 @@ def _skip_and_collect_streams(
 		ValueError: if *strict* is True and a Stream Header
 			checksum fails.
 	"""
-	streams: list[StreamInfo] = []
 	pos = start_pos
-
 	if pos % 4 != 0:
 		_log.warning(f"Correcting unaligned offset {pos :#x}")
 		pos = (pos + 4 - 1) & ~(4 - 1)
 
+	f.seek(pos)
+
 	while True:
-		f.seek(pos)
-		raw_hdr = _read_exact(f, STREAM_HDR_SIZE)
+		try:
+			raw_hdr = _read_exact(f, STREAM_HDR_SIZE)
+		except EOFError as error:
+			_log.error("Reached end when reading stream header")
+			_log.error(error)
+			raise
 
 		if raw_hdr[:4] in KnownDBLK:
 			if not expect_dblk:
 				_log.warning(f"Unexpected DBLK at offset {pos :#x} when parsing stream")
-			return pos, streams
+			f.seek(pos)
+			break
 
 		stream_hdr = StreamHeader.from_bytes(raw_hdr, strict_checksum=strict)
 		if _log.isEnabledFor(logging.DEBUG):
 			_log.debug(f"Stream, offset {pos :#x}: {stream_hdr !r}")
 
-		stream_data = _read_exact(f, stream_hdr.length) if stream_hdr.length <= 256 else None
-		streams.append(StreamInfo.from_header(stream_hdr, stream_data, file_offset=pos))
-
-		# Stream data starts immediately after the 22-byte header.
-		data_start = pos + STREAM_HDR_SIZE
-
-		if stream_hdr.type_id == KnownStream.STREAM_PAD:
-			# SPAD data fills exactly to the next FLB boundary.
-			return data_start + stream_hdr.length, streams
-
 		if stream_hdr.type_id == KnownStream.STREAM_CORRUPT:
 			_log.error(f"Corrupt stream marker at offset {pos :#x}")
 
+		# Stream data starts immediately after the 22-byte header.
+		data_offset = pos + STREAM_HDR_SIZE
+
+#		stream_data = _read_exact(f, stream_hdr.length) if stream_hdr.length <= 256 else None
+#		info = StreamInfo.from_header(stream_hdr, stream_data, file_offset=pos)
+		stream_access = StreamAccess(stream_hdr, f)
+		yield stream_access
+		stream_access._valid = False
+
 		# Non-SPAD stream: skip header + declared data length,
 		# then realign to 4-byte boundary for the next stream header.
-		pos = data_start + stream_hdr.length
+		pos = data_offset + stream_hdr.length
 		# NOTE: Special stream type observed which bypass alignment
 		if stream_hdr.type_id != b'CPAD' and pos % 4 != 0:
 			pos = (pos + 4 - 1) & ~(4 - 1)
+
+		f.seek(pos)
+
+		if stream_hdr.type_id == KnownStream.STREAM_PAD:
+			# SPAD data fills exactly to the next FLB boundary.
+			break
+
+	return pos
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -282,7 +320,7 @@ def mtf_dblk_parser(
 	backup_in: BinaryIO, *,
 	header_in: BinaryIO | None =None,
 	strict: bool =False,
-) -> Iterator[DblkInfo]:
+) -> Iterator[tuple[DBLK, Iterator[StreamAccess]]]:
 	"""Parse an MTF (BKF) file and return a list of DBLK info records.
 
 	The file must be opened in binary mode (``"rb"``).
@@ -316,14 +354,13 @@ def mtf_dblk_parser(
 	sfmb_size = tape_dblk.sfmb_size         # Soft Filemark Block Size
 
 	# ── Phase 2: Traverse through DBLKs ──
-	pos = 0
+	pos = backup_in.tell()
 
 	for i in itertools.count(1):
-		backup_in.seek(pos)
 		try:
-			raw_data = _read_exact(backup_in, flb_size)
+			raw_data = _read_exact(backup_in, flb_size) # BUG: May end a bit early for truncated file
 		except EOFError as error:
-			_log.warning("Reached end when trying to parse DBLK:")
+			_log.warning("Reached end when reading next DBLK:")
 			_log.warning(error)
 			break
 
@@ -338,23 +375,29 @@ def mtf_dblk_parser(
 		# ── Skip streams and record them ──
 		if dblk.type_id == KnownDBLK.MTF_SFMB:
 			# SFMB has no data streams (Section 5.2.10).
-			streams = list[StreamInfo]()
-			pos = dblk_offset + (sfmb_size if sfmb_size else dblk.header.next_offset)
+			stream_accessor = iter(())
+			backup_in.seek(dblk_offset + (sfmb_size if sfmb_size else dblk.header.next_offset))
 		else:
-			try:
-				pos, streams = _skip_and_collect_streams(
-					backup_in, dblk_offset + dblk.header.next_offset,
-					# NOTE: Leading DBLKs in continuation may have no streams
-					expect_dblk=dblk.header.is_continuation,
-					strict=strict)
-			except EOFError as error:
-				_log.warning("Reached end when skipping streams:")
-				_log.warning(error)
-				break
+			stream_accessor = _dblk_stream_accessor(
+				backup_in, dblk_offset + dblk.header.next_offset,
+				# NOTE: Leading DBLKs in continuation may have no streams
+				expect_dblk=dblk.header.is_continuation,
+				strict=strict)
 
 		# ── Build DblkInfo (after streams are known) ──
-		info = DblkInfo.from_dblk(dblk, streams, file_offset=dblk_offset)
-		yield info
+#		info = DblkInfo.from_dblk(dblk, streams, file_offset=dblk_offset)
+		yield dblk, stream_accessor
+
+		try:
+			for stream in stream_accessor:
+				pass # Drain
+			backup_in.seek(-1, 1) # HACK
+			_read_exact(backup_in, 1) # Ensure stream completeness
+		except EOFError:
+			_log.error("Reached end when skipping streams")
+			raise
+
+		pos = backup_in.tell()
 
 		if dblk.type_id == KnownDBLK.MTF_EOTM:
 			_log.info("EOTM reached")
@@ -365,9 +408,9 @@ def mtf_dblk_parser(
 def parse_mtf_dblk(
 	backup_in: BinaryIO, *,
 	header_in: BinaryIO | None =None,
-	strict: bool =False,
-) -> list[DblkInfo]:
-	return list(mtf_dblk_parser(header_in=header_in, backup_in=backup_in, strict=strict))
+) -> list[tuple[DBLK, list[StreamAccess]]]:
+	parser = mtf_dblk_parser(header_in=header_in, backup_in=backup_in, strict=True)
+	return [(dblk, list(stream_accessor)) for dblk, stream_accessor in parser]
 
 # ═══════════════════════════════════════════════════════════════════
 # Output helpers
@@ -387,9 +430,21 @@ _dblk_level_map = {
 		KnownDBLK.MTF_SFMB: 0,
 	}.items()}
 
-def inspect_mtf_dblk_streaming(src: Iterable[DblkInfo], stream: TextIO | None =None) -> Iterator[DblkInfo]:
+def inspect_mtf_dblk_streaming(
+	src: Iterable[tuple[DBLK, Iterable[StreamAccess]]],
+	stream: TextIO | None =None
+) -> Iterator[DblkInfo]:
 	prev_level = 0
-	for dblk_info in src:
+	for dblk, stream_accessor in src:
+		stream_infos = list[StreamInfo]()
+		try:
+			for stream_access in stream_accessor:
+				stream_data = stream_access.data_access()() if stream_access.size <= 256 else None
+				stream_infos.append(StreamInfo.from_header(stream_access.header, stream_data))
+		except EOFError:
+			ended = True
+
+		dblk_info = DblkInfo.from_dblk(dblk, stream_infos)
 		level = _dblk_level_map.get(dblk_info.type_id, -1)
 		level = prev_level if level == -1 else level
 
@@ -401,6 +456,6 @@ def inspect_mtf_dblk_streaming(src: Iterable[DblkInfo], stream: TextIO | None =N
 		yield dblk_info
 		prev_level = level
 
-def inspect_mtf_dblk(dblks: Iterable[DblkInfo], stream: TextIO | None =None) -> None:
+def inspect_mtf_dblk(dblks: Iterable[tuple[DBLK, Iterable[StreamAccess]]], stream: TextIO | None =None) -> None:
 	for _ in inspect_mtf_dblk_streaming(dblks, stream):
 		pass
